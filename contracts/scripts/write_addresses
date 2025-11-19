@@ -1,0 +1,36 @@
+// scripts/write_addresses.ts
+import fs from "fs";
+import path from "path";
+
+const deployedFile = path.join(__dirname, "..", "deployed_addresses.json");
+
+export function writeAddress(name: string, address: string) {
+  let json: Record<string, string> = {};
+
+  if (fs.existsSync(deployedFile)) {
+    json = JSON.parse(fs.readFileSync(deployedFile, "utf8"));
+  }
+
+  json[name] = address;
+
+  // sort keys for readability
+  const sorted = Object.keys(json)
+    .sort()
+    .reduce((acc, key) => {
+      acc[key] = json[key];
+      return acc;
+    }, {} as Record<string, string>);
+
+  fs.writeFileSync(deployedFile, JSON.stringify(sorted, null, 2));
+  console.log(`Saved: ${name} → ${address}`);
+}
+
+// If this file is executed directly (node scripts/write_addresses.ts)
+if (require.main === module) {
+  if (!process.argv[2] || !process.argv[3]) {
+    console.log("Usage: npx ts-node scripts/write_addresses.ts <Name> <Address>");
+    process.exit(1);
+  }
+  writeAddress(process.argv[2], process.argv[3]);
+}
+
