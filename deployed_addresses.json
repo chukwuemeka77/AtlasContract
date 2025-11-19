@@ -1,0 +1,10 @@
+{
+  "WETH": "0x...",
+  "AtlasFactory": "0x...",
+  "AtlasRouter": "0x...",
+  "AtlasToken": "0x...",
+  "AtlasVault": "0x...",
+  "LiquidityLP": "0x...",
+  "RewardDistributor": "0x...",
+  "AtlasPresale": "0x..."
+}
