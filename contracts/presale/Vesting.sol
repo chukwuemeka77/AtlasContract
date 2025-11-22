@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "../utils/SafeERC20.sol";
 
-/**
- * @title Vesting
- * @notice Handles token vesting for presale participants.
- */
+interface IERC20Decimals {
+    function decimals() external view returns (uint8);
+}
+
 contract Vesting is Ownable {
+    using SafeERC20 for IERC20;
+
     IERC20 public token;
 
     struct VestingSchedule {
@@ -53,7 +55,14 @@ contract Vesting is Ownable {
         uint256 amount = releasableAmount(beneficiary);
         require(amount > 0, "Nothing to release");
         schedules[beneficiary].released += amount;
-        token.transfer(beneficiary, amount);
+        IERC20(address(token)).safeTransfer(beneficiary, amount);
         emit TokensReleased(beneficiary, amount);
+    }
+
+    /// @notice Batch release multiple beneficiaries
+    function batchRelease(address[] calldata beneficiaries) external {
+        for (uint i = 0; i < beneficiaries.length; i++) {
+            release(beneficiaries[i]);
+        }
     }
 }
