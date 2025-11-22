@@ -1,66 +1,94 @@
 // scripts/fund_presale.ts
+import { ethers } from "hardhat";
 import fs from "fs";
 import path from "path";
-import { ethers } from "hardhat";
 import * as dotenv from "dotenv";
 dotenv.config();
 
+const deployedFile = path.join(__dirname, "..", "deployed_addresses.json");
+
 async function main() {
-  const deployedFile = path.join(__dirname, "..", "deployments", "deployed_addresses.json");
-  if (!fs.existsSync(deployedFile)) throw new Error("deployed_addresses.json not found. Run deploy_all.ts first.");
+  if (!fs.existsSync(deployedFile)) throw new Error("deployed_addresses.json not found");
+  const addresses = JSON.parse(fs.readFileSync(deployedFile, "utf8"));
 
-  const addresses = JSON.parse(fs.readFileSync(deployedFile, "utf-8"));
-  const deployer = (await ethers.getSigners())[0];
-  console.log("Funding presale and LP from Vault as:", deployer.address);
+  const [deployer] = await ethers.getSigners();
+  console.log("Funding presale and LP allocations as:", deployer.address);
 
+  // Load contracts
   const AtlasToken = await ethers.getContractFactory("token/AtlasToken");
-  const token = AtlasToken.attach(addresses["AtlasToken"]);
+  const atlasToken = AtlasToken.attach(addresses["AtlasToken"]);
 
   const AtlasVault = await ethers.getContractFactory("vaults/AtlasVault");
   const vault = AtlasVault.attach(addresses["AtlasVault"]);
 
+  const Vesting = await ethers.getContractFactory("presale/Vesting");
+  const vesting = Vesting.attach(addresses["Vesting"]);
+
   const Presale = await ethers.getContractFactory("presale/Presale");
-  const presale = Presale.attach(addresses["Presale"]);
+  const presale = Presale.attach(addresses["AtlasPresale"]);
 
-  const LP_REWARDS = process.env.LP_REWARD_ALLOCATION || "1000000000";
+  const LPRewardSink = await ethers.getContractFactory("rewards/LPRewardSink");
+  const lpSink = LPRewardSink.attach(addresses["LiquidityLP"]);
+
+  // Allocations
+  const decimals = await atlasToken.decimals().catch(() => 18);
   const PRESALE_ALLOCATION = process.env.PRESALE_ALLOCATION || "300000000";
+  const LP_REWARDS = process.env.LP_REWARD_ALLOCATION || "1000000000";
 
-  const decimals = await token.decimals().catch(() => 18);
-  const lpAmount = ethers.utils.parseUnits(LP_REWARDS, decimals);
-  const presaleAmount = ethers.utils.parseUnits(PRESALE_ALLOCATION, decimals);
+  const presaleAmountUnits = ethers.utils.parseUnits(PRESALE_ALLOCATION, decimals);
+  const lpAmountUnits = ethers.utils.parseUnits(LP_REWARDS, decimals);
 
-  // Fund Presale
-  try {
-    if ((vault as any).transfer) {
-      await (vault as any).transfer(presale.address, presaleAmount);
-      console.log(`Transferred ${PRESALE_ALLOCATION} tokens from Vault → Presale`);
-    } else {
-      // fallback: use ERC20 transfer from deployer
-      await token.transfer(presale.address, presaleAmount);
-      console.log(`Transferred ${PRESALE_ALLOCATION} tokens from deployer → Presale`);
-    }
-  } catch (err: any) {
-    console.warn("Presale funding failed:", err.message);
+  // === 1) Fund Vesting schedules ===
+  console.log("\n1) Funding Vesting Schedules...");
+
+  const vestingBeneficiaries = JSON.parse(process.env.VESTING_BENEFICIARIES || "[]");
+  const vestingAmounts = JSON.parse(process.env.VESTING_AMOUNTS || "[]");
+
+  if (vestingBeneficiaries.length !== vestingAmounts.length) {
+    throw new Error("VESTING_BENEFICIARIES and VESTING_AMOUNTS length mismatch");
   }
 
-  // Fund LP Rewards (send to Vault or LP sink)
-  const LPRewardSinkAddress = addresses["LPRewardSink"];
-  try {
-    if ((vault as any).transfer) {
-      await (vault as any).transfer(LPRewardSinkAddress, lpAmount);
-      console.log(`Transferred ${LP_REWARDS} tokens from Vault → LPRewardSink`);
-    } else {
-      await token.transfer(LPRewardSinkAddress, lpAmount);
-      console.log(`Transferred ${LP_REWARDS} tokens from deployer → LPRewardSink`);
-    }
-  } catch (err: any) {
-    console.warn("LPReward funding failed:", err.message);
+  for (let i = 0; i < vestingBeneficiaries.length; i++) {
+    const beneficiary = vestingBeneficiaries[i];
+    const amount = ethers.utils.parseUnits(vestingAmounts[i], decimals);
+
+    // Transfer tokens from deployer to vesting contract
+    const txApprove = await atlasToken.approve(vesting.address, amount);
+    await txApprove.wait();
+
+    const txSchedule = await vesting.setVestingSchedule(
+      beneficiary,
+      amount,
+      Math.floor(Date.now() / 1000), // start now
+      0, // cliff
+      30 * 24 * 60 * 60 // duration 30 days default
+    );
+    await txSchedule.wait();
+    console.log(`Set vesting for ${beneficiary}: ${vestingAmounts[i]} tokens`);
   }
 
-  console.log("✅ Presale & LP funding complete");
+  // === 2) Fund Presale ===
+  console.log("\n2) Funding Presale Contract...");
+  const txApprovePresale = await atlasToken.approve(presale.address, presaleAmountUnits);
+  await txApprovePresale.wait();
+  const txFundPresale = await atlasToken.transfer(presale.address, presaleAmountUnits);
+  await txFundPresale.wait();
+  console.log(`Transferred ${PRESALE_ALLOCATION} tokens to Presale contract`);
+
+  // === 3) Fund LP Rewards ===
+  console.log("\n3) Funding LP Reward Sink...");
+  const txApproveLP = await atlasToken.approve(lpSink.address, lpAmountUnits);
+  await txApproveLP.wait();
+  const txFundLP = await atlasToken.transfer(lpSink.address, lpAmountUnits);
+  await txFundLP.wait();
+  console.log(`Transferred ${LP_REWARDS} tokens to LPRewardSink`);
+
+  console.log("\n✅ Funding complete");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error("Funding failed:", err);
+    process.exit(1);
+  });
