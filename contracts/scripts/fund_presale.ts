@@ -1,33 +1,66 @@
-// scripts/fund_presale.ts
 import { ethers } from "hardhat";
-import fs from "fs";
 import * as dotenv from "dotenv";
+import fs from "fs";
+
 dotenv.config();
 
+const {
+  PRESALE_ALLOCATION,
+  LP_REWARD_ALLOCATION,
+  DEX_LIQUIDITY_ALLOCATION,
+  CEX_LISTINGS_ALLOCATION,
+  VAULT_ADMIN_ADDRESS
+} = process.env;
+
 async function main() {
-  const deployed = JSON.parse(fs.readFileSync("deployments/deployed_addresses.json", "utf8"));
-  const atlasTokenAddr = deployed["AtlasToken"];
-  const presaleAddr = deployed["Presale"];
-  const lpSinkAddr = deployed["LPRewardSink"];
-
   const [deployer] = await ethers.getSigners();
-  const atlasToken = await ethers.getContractAt("AtlasToken", atlasTokenAddr);
+  console.log("Funding presale and vaults with:", deployer.address);
 
-  const presaleAllocation = ethers.utils.parseUnits("600000000", 18);
-  const lpAllocation = ethers.utils.parseUnits("400000000", 18);
+  // Load deployed addresses
+  const deployed = JSON.parse(fs.readFileSync("deployed_addresses.json", "utf-8"));
+  const tokenAddress = deployed.token;
+  const vaultAddress = deployed.vault;
+  const presaleAddress = deployed.presale;
+  const vestingAddress = deployed.vesting;
 
-  console.log("Funding Presale & LP reward allocations...");
+  const token = await ethers.getContractAt("AtlasToken", tokenAddress);
+  const vault = await ethers.getContractAt("AtlasVault", vaultAddress);
+  const presale = await ethers.getContractAt("AtlasPresale", presaleAddress);
+  const vesting = await ethers.getContractAt("AtlasVesting", vestingAddress);
 
-  // Presale
-  await atlasToken.transfer(presaleAddr, presaleAllocation);
-  console.log(`Presale funded: ${ethers.utils.formatUnits(presaleAllocation)} tokens`);
+  const decimals = 18;
 
-  // LP Rewards
-  await atlasToken.transfer(lpSinkAddr, lpAllocation);
-  console.log(`LP rewards funded: ${ethers.utils.formatUnits(lpAllocation)} tokens`);
+  // Helper to parse allocation amounts
+  const parseAmount = (amountStr: string | undefined) => ethers.utils.parseUnits(amountStr || "0", decimals);
+
+  // 1️⃣ Fund Presale
+  const presaleAmount = parseAmount(PRESALE_ALLOCATION);
+  await token.transfer(vault.address, presaleAmount);
+  await vault.fundPresale(presale.address, presaleAmount, VAULT_ADMIN_ADDRESS);
+  console.log("Presale funded:", PRESALE_ALLOCATION);
+
+  // 2️⃣ Fund Vesting schedules (if required)
+  const lpRewardAmount = parseAmount(LP_REWARD_ALLOCATION);
+  await token.transfer(vault.address, lpRewardAmount);
+  await vault.fundVesting(vesting.address, lpRewardAmount);
+  console.log("LP/staking rewards funded:", LP_REWARD_ALLOCATION);
+
+  // 3️⃣ Fund DEX Liquidity
+  const dexLiquidityAmount = parseAmount(DEX_LIQUIDITY_ALLOCATION);
+  await token.transfer(vault.address, dexLiquidityAmount);
+  await vault.fundDexLiquidity(dexLiquidityAmount);
+  console.log("DEX liquidity funded:", DEX_LIQUIDITY_ALLOCATION);
+
+  // 4️⃣ Fund CEX listings
+  const cexAmount = parseAmount(CEX_LISTINGS_ALLOCATION);
+  await token.transfer(vault.address, cexAmount);
+  await vault.fundCexLiquidity(cexAmount);
+  console.log("CEX liquidity funded:", CEX_LISTINGS_ALLOCATION);
+
+  console.log("All presale and vault allocations completed safely.");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
 });
