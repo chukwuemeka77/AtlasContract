@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "../utils/SafeERC20.sol";
-
-interface IERC20Decimals {
-    function decimals() external view returns (uint8);
-}
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract Vesting is Ownable {
     using SafeERC20 for IERC20;
@@ -29,6 +26,11 @@ contract Vesting is Ownable {
     constructor(address _token, address _owner) {
         token = IERC20(_token);
         transferOwnership(_owner);
+    }
+
+    function setToken(address _token) external onlyOwner {
+        require(_token != address(0), "Invalid token");
+        token = IERC20(_token);
     }
 
     function setVestingSchedule(
@@ -55,14 +57,7 @@ contract Vesting is Ownable {
         uint256 amount = releasableAmount(beneficiary);
         require(amount > 0, "Nothing to release");
         schedules[beneficiary].released += amount;
-        IERC20(address(token)).safeTransfer(beneficiary, amount);
+        token.safeTransfer(beneficiary, amount);
         emit TokensReleased(beneficiary, amount);
-    }
-
-    /// @notice Batch release multiple beneficiaries
-    function batchRelease(address[] calldata beneficiaries) external {
-        for (uint i = 0; i < beneficiaries.length; i++) {
-            release(beneficiaries[i]);
-        }
     }
 }
