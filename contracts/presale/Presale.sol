@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "./Vesting.sol";
 import "../utils/SafeERC20.sol";
-import "../utils/Multicall.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-interface IVesting {
-    function setVestingSchedule(address, uint256, uint256, uint256, uint256) external;
-}
-
-contract Presale is Ownable, Multicall {
+contract Presale is Ownable {
     using SafeERC20 for IERC20;
 
     IERC20 public token;
-    IERC20 public paymentToken; // USDC or ETH wrapper
-    IVesting public vesting;
-
-    uint256 public price; // price per token in paymentToken
-    uint256 public sold;
+    Vesting public vesting;
+    IERC20 public paymentToken;
+    uint256 public price;
     uint256 public maxAllocation;
 
-    event Purchased(address indexed buyer, uint256 amount, uint256 cost);
+    event Purchased(address indexed buyer, uint256 amount);
 
     constructor(
         address _token,
@@ -30,29 +25,31 @@ contract Presale is Ownable, Multicall {
         uint256 _maxAllocation
     ) {
         token = IERC20(_token);
-        vesting = IVesting(_vesting);
+        vesting = Vesting(_vesting);
         paymentToken = IERC20(_paymentToken);
         price = _price;
         maxAllocation = _maxAllocation;
     }
 
-    /// @notice Buy tokens in presale
-    function buy(uint256 tokenAmount) external {
-        require(sold + tokenAmount <= maxAllocation, "Exceeds max allocation");
-        uint256 cost = (tokenAmount * price) / (10 ** 18); // assumes 18 decimals
-        paymentToken.safeTransferFrom(msg.sender, address(this), cost);
-        sold += tokenAmount;
-
-        // Set vesting schedule for buyer
-        uint256 start = block.timestamp;
-        uint256 cliff = 0;
-        uint256 duration = 30 days; // simple example
-        vesting.setVestingSchedule(msg.sender, tokenAmount, start, cliff, duration);
-        emit Purchased(msg.sender, tokenAmount, cost);
+    function setToken(address _token) external onlyOwner {
+        require(_token != address(0), "Invalid token");
+        token = IERC20(_token);
     }
 
-    /// @notice Admin can withdraw collected payment tokens
-    function withdrawPayments(address to, uint256 amount) external onlyOwner {
-        paymentToken.safeTransfer(to, amount);
+    function setVesting(address _vesting) external onlyOwner {
+        require(_vesting != address(0), "Invalid vesting");
+        vesting = Vesting(_vesting);
+    }
+
+    function buy(uint256 amount) external {
+        require(amount <= maxAllocation, "Exceeds max allocation");
+        uint256 cost = (amount * price) / (10**18);
+        paymentToken.safeTransferFrom(msg.sender, address(this), cost);
+
+        // send tokens to vesting schedule
+        token.safeTransfer(address(vesting), amount);
+        vesting.setVestingSchedule(msg.sender, amount, block.timestamp, 0, 30 days);
+
+        emit Purchased(msg.sender, amount);
     }
 }
