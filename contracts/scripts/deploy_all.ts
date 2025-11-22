@@ -5,6 +5,7 @@ import fs from "fs";
 dotenv.config();
 
 const {
+  VAULT_ADMIN_ADDRESS,
   PRESALE_ALLOCATION,
   LP_REWARD_ALLOCATION,
   DEX_LIQUIDITY_ALLOCATION,
@@ -12,117 +13,116 @@ const {
   TREASURY_ALLOCATION,
   MARKETING_ALLOCATION,
   TEAM_ALLOCATION,
-  PRESALE_PRICE,
-  PRESALE_VESTING_MONTHS,
-  PRESALE_TGE_PERCENT,
-  LP_REWARD_RATE_PER_SECOND,
-  VAULT_ADMIN_ADDRESS,
 } = process.env;
 
-const deployedAddressesFile = "deployed_addresses.json";
+if (!VAULT_ADMIN_ADDRESS) throw new Error("VAULT_ADMIN_ADDRESS not set in .env");
 
 async function main() {
-  const [deployer] = await ethers.getSigners();
-  console.log("Deploying contracts with:", deployer.address);
+  const deployed: Record<string, string> = {};
 
-  const deployed: any = {};
-
-  // -------------------------------
-  // 1️⃣ Deploy AtlasToken
-  // -------------------------------
-  const AtlasToken = await ethers.getContractFactory("AtlasToken");
-  const atlasToken = await upgrades.deployProxy(AtlasToken, ["Atlas Token", "ATLAS"], { kind: "uups" });
-  await atlasToken.deployed();
-  console.log("AtlasToken deployed at:", atlasToken.address);
-  deployed.AtlasToken = atlasToken.address;
+  console.log("Deploying contracts with admin:", VAULT_ADMIN_ADDRESS);
 
   // -------------------------------
-  // 2️⃣ Deploy AtlasPresale
+  // 1️⃣ Deploy Presale
   // -------------------------------
-  const AtlasPresale = await ethers.getContractFactory("AtlasPresale");
-  const presale = await upgrades.deployProxy(
-    AtlasPresale,
-    [
-      atlasToken.address,
-      PRESALE_PRICE,
-      PRESALE_TGE_PERCENT,
-      PRESALE_VESTING_MONTHS,
-      deployer.address, // admin
-    ],
-    { kind: "uups" }
-  );
+  const Presale = await ethers.getContractFactory("AtlasPresale");
+  const presale = await upgrades.deployProxy(Presale, [VAULT_ADMIN_ADDRESS], { kind: "uups" });
   await presale.deployed();
-  console.log("AtlasPresale deployed at:", presale.address);
   deployed.AtlasPresale = presale.address;
+  console.log("AtlasPresale deployed at:", presale.address);
 
   // -------------------------------
-  // 3️⃣ Deploy AtlasVesting (Flexible LP)
+  // 2️⃣ Deploy Vesting
   // -------------------------------
-  const AtlasVesting = await ethers.getContractFactory("AtlasVesting");
-  const vesting = await upgrades.deployProxy(
-    AtlasVesting,
-    [atlasToken.address, LP_REWARD_RATE_PER_SECOND],
-    { kind: "uups" }
-  );
+  const Vesting = await ethers.getContractFactory("AtlasVesting");
+  const vesting = await upgrades.deployProxy(Vesting, [VAULT_ADMIN_ADDRESS], { kind: "uups" });
   await vesting.deployed();
-  console.log("AtlasVesting deployed at:", vesting.address);
   deployed.AtlasVesting = vesting.address;
+  console.log("AtlasVesting deployed at:", vesting.address);
 
   // -------------------------------
-  // 4️⃣ Deploy AtlasBridge
+  // 3️⃣ Deploy Launchpad
   // -------------------------------
-  const AtlasBridge = await ethers.getContractFactory("AtlasBridge");
-  const bridge = await upgrades.deployProxy(AtlasBridge, [atlasToken.address, VAULT_ADMIN_ADDRESS], { kind: "uups" });
+  const Launchpad = await ethers.getContractFactory("AtlasLaunchpad");
+  const launchpad = await upgrades.deployProxy(Launchpad, [VAULT_ADMIN_ADDRESS], { kind: "uups" });
+  await launchpad.deployed();
+  deployed.AtlasLaunchpad = launchpad.address;
+  console.log("AtlasLaunchpad deployed at:", launchpad.address);
+
+  // -------------------------------
+  // 4️⃣ Deploy Token
+  // -------------------------------
+  const Token = await ethers.getContractFactory("AtlasToken");
+  const token = await upgrades.deployProxy(Token, [VAULT_ADMIN_ADDRESS], { kind: "uups" });
+  await token.deployed();
+  deployed.AtlasToken = token.address;
+  console.log("AtlasToken deployed at:", token.address);
+
+  // -------------------------------
+  // 5️⃣ Deploy Bridge
+  // -------------------------------
+  const Bridge = await ethers.getContractFactory("AtlasBridge");
+  const bridge = await upgrades.deployProxy(Bridge, [token.address, VAULT_ADMIN_ADDRESS], { kind: "uups" });
   await bridge.deployed();
-  console.log("AtlasBridge deployed at:", bridge.address);
   deployed.AtlasBridge = bridge.address;
+  console.log("AtlasBridge deployed at:", bridge.address);
 
   // -------------------------------
-  // 5️⃣ Deploy AMM (Liquidity Pool / Router)
+  // 6️⃣ Deploy AMM (Router/Factory)
   // -------------------------------
-  const AtlasFactory = await ethers.getContractFactory("AtlasFactory");
-  const factory = await AtlasFactory.deploy(deployer.address);
+  const Factory = await ethers.getContractFactory("AtlasFactory");
+  const factory = await Factory.deploy(VAULT_ADMIN_ADDRESS);
   await factory.deployed();
   deployed.AtlasFactory = factory.address;
 
-  const AtlasRouter = await ethers.getContractFactory("AtlasRouter");
-  const router = await AtlasRouter.deploy(factory.address);
+  const Router = await ethers.getContractFactory("AtlasRouter");
+  const router = await Router.deploy(factory.address, await ethers.getContractAt("WETH", process.env.WETH_ADDRESS).then(w => w.address));
   await router.deployed();
   deployed.AtlasRouter = router.address;
 
-  // -------------------------------
-  // 6️⃣ Deploy RewardDistributor / Vault
-  // -------------------------------
-  const RewardDistributor = await ethers.getContractFactory("RewardDistributor");
-  const rewards = await RewardDistributor.deploy(atlasToken.address, VAULT_ADMIN_ADDRESS);
-  await rewards.deployed();
-  deployed.RewardDistributor = rewards.address;
+  console.log("AMM deployed: Factory =", factory.address, "Router =", router.address);
 
   // -------------------------------
-  // 7️⃣ Fund Presale, LP, Treasury, DEX/CEX allocations
+  // 7️⃣ Deploy Reward Distributor / Vault
   // -------------------------------
-  const allocations = [
-    { addr: presale.address, amount: PRESALE_ALLOCATION },
-    { addr: vesting.address, amount: LP_REWARD_ALLOCATION },
-    { addr: router.address, amount: DEX_LIQUIDITY_ALLOCATION },
-    // CEX listings can be sent to treasury/admin for external use
-    { addr: VAULT_ADMIN_ADDRESS, amount: CEX_LISTINGS_ALLOCATION },
-    { addr: VAULT_ADMIN_ADDRESS, amount: TREASURY_ALLOCATION },
-    { addr: VAULT_ADMIN_ADDRESS, amount: MARKETING_ALLOCATION },
-    { addr: VAULT_ADMIN_ADDRESS, amount: TEAM_ALLOCATION },
-  ];
-
-  for (const alloc of allocations) {
-    const amount = ethers.utils.parseUnits(alloc.amount.toString(), 18);
-    await atlasToken.mint(alloc.addr, amount);
-    console.log(`Minted ${alloc.amount} tokens to ${alloc.addr}`);
-  }
+  const Reward = await ethers.getContractFactory("RewardDistributor");
+  const reward = await upgrades.deployProxy(Reward, [token.address, VAULT_ADMIN_ADDRESS], { kind: "uups" });
+  await reward.deployed();
+  deployed.RewardDistributor = reward.address;
+  console.log("RewardDistributor deployed at:", reward.address);
 
   // -------------------------------
-  // 8️⃣ Save deployed addresses
+  // 8️⃣ Set Roles and Fund Allocations
   // -------------------------------
-  fs.writeFileSync(deployedAddressesFile, JSON.stringify(deployed, null, 2));
-  console.log("Deployed addresses saved to", deployedAddressesFile);
+  const MINTER_ROLE = await token.MINTER_ROLE();
+  await token.grantRole(MINTER_ROLE, VAULT_ADMIN_ADDRESS);
+
+  // Presale allocation
+  await token.transfer(presale.address, ethers.utils.parseUnits(PRESALE_ALLOCATION || "0", 18));
+
+  // LP & staking rewards
+  await token.transfer(reward.address, ethers.utils.parseUnits(LP_REWARD_ALLOCATION || "0", 18));
+
+  // DEX liquidity
+  await token.transfer(router.address, ethers.utils.parseUnits(DEX_LIQUIDITY_ALLOCATION || "0", 18));
+
+  // CEX listings
+  await token.transfer(VAULT_ADMIN_ADDRESS, ethers.utils.parseUnits(CEX_LISTINGS_ALLOCATION || "0", 18));
+
+  // Treasury
+  await token.transfer(VAULT_ADMIN_ADDRESS, ethers.utils.parseUnits(TREASURY_ALLOCATION || "0", 18));
+
+  // Marketing
+  await token.transfer(VAULT_ADMIN_ADDRESS, ethers.utils.parseUnits(MARKETING_ALLOCATION || "0", 18));
+
+  // Team
+  await token.transfer(VAULT_ADMIN_ADDRESS, ethers.utils.parseUnits(TEAM_ALLOCATION || "0", 18));
+
+  // -------------------------------
+  // Save deployed addresses
+  // -------------------------------
+  fs.writeFileSync("deployed_addresses.json", JSON.stringify(deployed, null, 2));
+  console.log("All deployed addresses saved to deployed_addresses.json");
 }
 
 main().catch((err) => {
