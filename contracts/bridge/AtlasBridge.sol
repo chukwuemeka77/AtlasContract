@@ -2,73 +2,38 @@
 pragma solidity ^0.8.24;
 
 import "./AtlasToken.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "../utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "../utils/Multicall.sol";
 
-/**
- * @title AtlasBridge
- * @notice Handles cross-chain locking and minting of AtlasToken.
- * Implements relayer-controlled minting/unlocking to prevent double spending.
- */
-contract AtlasBridge is Ownable, AccessControl {
+contract AtlasBridge is Ownable, Multicall {
+    using SafeERC20 for IERC20;
+
     AtlasToken public token;
 
-    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
-
-    // Mapping to track processed cross-chain messages
-    mapping(bytes32 => bool) public processedMessages;
-
     event Locked(address indexed user, uint256 amount, string targetChain);
-    event Unlocked(address indexed user, uint256 amount, string sourceChain);
     event Minted(address indexed user, uint256 amount);
+    event Burned(address indexed user, uint256 amount);
 
-    constructor(AtlasToken _token, address admin) {
+    constructor(AtlasToken _token) {
         token = _token;
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
-        transferOwnership(admin);
     }
 
-    /**
-     * @notice Lock tokens on source chain
-     */
+    /// @notice Lock tokens for bridging to another chain
     function lock(uint256 amount, string calldata targetChain) external {
-        require(amount > 0, "Amount must be > 0");
-        token.transferFrom(msg.sender, address(this), amount);
+        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), amount);
         emit Locked(msg.sender, amount, targetChain);
     }
 
-    /**
-     * @notice Unlock tokens on source chain (after burn on target chain)
-     */
-    function unlock(address to, uint256 amount, string calldata sourceChain, bytes32 txId) external onlyRole(RELAYER_ROLE) {
-        require(!processedMessages[txId], "Already processed");
-        require(amount > 0, "Amount must be > 0");
-
-        processedMessages[txId] = true;
-        token.transfer(to, amount);
-        emit Unlocked(to, amount, sourceChain);
-    }
-
-    /**
-     * @notice Mint tokens on target chain (bridge)
-     */
-    function mint(address to, uint256 amount, bytes32 txId) external onlyRole(RELAYER_ROLE) {
-        require(!processedMessages[txId], "Already processed");
-        require(amount > 0, "Amount must be > 0");
-
-        processedMessages[txId] = true;
-        token.mint(to, amount);
+    /// @notice Mint tokens on this chain (only owner / bridge)
+    function mint(address to, uint256 amount) external onlyOwner {
+        token.bridgeMint(to, amount);
         emit Minted(to, amount);
     }
 
-    /**
-     * @notice Set a new relayer
-     */
-    function setRelayer(address relayer, bool approved) external onlyOwner {
-        if (approved) {
-            _grantRole(RELAYER_ROLE, relayer);
-        } else {
-            _revokeRole(RELAYER_ROLE, relayer);
-        }
+    /// @notice Burn tokens (for bridging out)
+    function burn(uint256 amount) external {
+        token.bridgeBurn(msg.sender, amount);
+        emit Burned(msg.sender, amount);
     }
 }
