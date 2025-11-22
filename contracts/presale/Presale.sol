@@ -1,50 +1,58 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "../utils/SafeERC20.sol";
-import "./Vesting.sol";
+import "../utils/Multicall.sol";
 
-/**
- * @title Presale
- * @notice Conducts token presale and deposits tokens into vesting.
- */
-contract Presale is Ownable {
+interface IVesting {
+    function setVestingSchedule(address, uint256, uint256, uint256, uint256) external;
+}
+
+contract Presale is Ownable, Multicall {
     using SafeERC20 for IERC20;
 
-    IERC20 public saleToken;
-    IERC20 public paymentToken; // e.g., USDC
-    Vesting public vesting;
-    uint256 public price; // paymentToken per saleToken
+    IERC20 public token;
+    IERC20 public paymentToken; // USDC or ETH wrapper
+    IVesting public vesting;
 
-    mapping(address => uint256) public purchased;
+    uint256 public price; // price per token in paymentToken
+    uint256 public sold;
+    uint256 public maxAllocation;
 
-    event Purchased(address indexed buyer, uint256 amountPaid, uint256 tokensAllocated);
+    event Purchased(address indexed buyer, uint256 amount, uint256 cost);
 
     constructor(
-        address _saleToken,
-        address _paymentToken,
+        address _token,
         address _vesting,
+        address _paymentToken,
         uint256 _price,
-        address _owner
+        uint256 _maxAllocation
     ) {
-        saleToken = IERC20(_saleToken);
+        token = IERC20(_token);
+        vesting = IVesting(_vesting);
         paymentToken = IERC20(_paymentToken);
-        vesting = Vesting(_vesting);
         price = _price;
-        transferOwnership(_owner);
+        maxAllocation = _maxAllocation;
     }
 
-    function buy(uint256 paymentAmount) external {
-        uint256 tokenAmount = (paymentAmount * 1e18) / price;
-        paymentToken.safeTransferFrom(msg.sender, address(this), paymentAmount);
-        vesting.setVestingSchedule(msg.sender, tokenAmount, block.timestamp, 0, 30 days); // simple 30-day linear vesting
-        purchased[msg.sender] += tokenAmount;
-        emit Purchased(msg.sender, paymentAmount, tokenAmount);
+    /// @notice Buy tokens in presale
+    function buy(uint256 tokenAmount) external {
+        require(sold + tokenAmount <= maxAllocation, "Exceeds max allocation");
+        uint256 cost = (tokenAmount * price) / (10 ** 18); // assumes 18 decimals
+        paymentToken.safeTransferFrom(msg.sender, address(this), cost);
+        sold += tokenAmount;
+
+        // Set vesting schedule for buyer
+        uint256 start = block.timestamp;
+        uint256 cliff = 0;
+        uint256 duration = 30 days; // simple example
+        vesting.setVestingSchedule(msg.sender, tokenAmount, start, cliff, duration);
+        emit Purchased(msg.sender, tokenAmount, cost);
     }
 
-    function withdrawPayment(address to) external onlyOwner {
-        paymentToken.safeTransfer(to, paymentToken.balanceOf(address(this)));
+    /// @notice Admin can withdraw collected payment tokens
+    function withdrawPayments(address to, uint256 amount) external onlyOwner {
+        paymentToken.safeTransfer(to, amount);
     }
 }
