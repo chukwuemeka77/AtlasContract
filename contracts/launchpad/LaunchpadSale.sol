@@ -1,169 +1,109 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "../utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "../utils/SafeERC20.sol";
+import "../token/AtlasToken.sol";
+import "../utils/LiquidityLocker.sol";
 
-interface IRouter {
-    function addLiquidity(
-        address tokenA,
-        address tokenB,
-        uint amountADesired,
-        uint amountBDesired,
-        uint amountAMin,
-        uint amountBMin,
-        address to,
-        uint deadline
-    ) external returns (uint, uint, uint);
-}
+/**
+ * @title LaunchpadSale
+ * @notice Manages token presale, optional buyer vesting, and mandatory liquidity lock
+ */
+contract LaunchpadSale is Ownable, ReentrancyGuard {
+    using SafeERC20 for AtlasToken;
 
-contract LaunchpadSale is Ownable {
-    using SafeERC20 for IERC20;
+    AtlasToken public saleToken;       // token being sold
+    address public treasury;           // USDC or ETH collected
+    address public vault;              // team/founder vesting and liquidity lock
+    LiquidityLocker public liquidityLocker;
 
-    IERC20 public token;
-    IERC20 public paymentToken;
-    address public projectOwner;
-    uint256 public price;          // paymentToken per token
-    uint256 public hardcap;        // max tokens for sale
-    uint256 public sold;           // total tokens sold
-    uint8 public tgePercent;       // percent released at TGE
-    uint256 public vestingDuration; // optional vesting
-    bool public autoAddLiquidity;   // optional liquidity add
-    address public router;           // router address for liquidity
-    address public vault;            // treasury address
-    bool public finalized;
+    uint256 public pricePerToken;      // presale price in USDC
+    uint256 public liquidityPercent;   // % of raised funds to lock as liquidity
+    bool public buyerVesting;          // optional buyer vesting flag
 
-    mapping(address => uint256) public contributed;
-    mapping(address => uint256) public allocated;
-    mapping(address => uint256) public claimed; // track claimed tokens for vesting
+    struct BuyerInfo {
+        uint256 amountBought;
+        uint256 claimed;
+        uint256 startTime;
+        uint256 endTime;
+    }
 
-    uint256 public startTime;
+    mapping(address => BuyerInfo) public buyers;
 
-    event Bought(address indexed buyer, uint256 payAmount, uint256 tokenAmount);
-    event Finalized(uint256 liquidityToken, uint256 liquidityPayment);
+    event Purchased(address indexed buyer, uint256 amount);
+    event Claimed(address indexed buyer, uint256 amount);
 
     constructor(
-        address _owner,
-        address _token,
-        address _paymentToken,
-        uint256 _price,
-        uint256 _hardcap,
-        uint8 _tgePercent,
-        uint256 _vestingDuration,
-        bool _autoAddLiquidity,
-        address _router,
-        address _vault
+        AtlasToken _saleToken,
+        address _treasury,
+        address _vault,
+        address _liquidityLocker,
+        uint256 _pricePerToken,
+        uint256 _liquidityPercent,
+        bool _buyerVesting
     ) {
-        require(_owner != address(0), "zero owner");
-        require(_token != address(0), "zero token");
-        require(_paymentToken != address(0), "zero payment");
-
-        projectOwner = _owner;
-        token = IERC20(_token);
-        paymentToken = IERC20(_paymentToken);
-        price = _price;
-        hardcap = _hardcap;
-        tgePercent = _tgePercent;
-        vestingDuration = _vestingDuration;
-        autoAddLiquidity = _autoAddLiquidity;
-        router = _router;
+        require(_treasury != address(0) && _vault != address(0) && _liquidityLocker != address(0), "zero address");
+        saleToken = _saleToken;
+        treasury = _treasury;
         vault = _vault;
-
-        _transferOwnership(_owner);
-        startTime = block.timestamp;
+        liquidityLocker = LiquidityLocker(_liquidityLocker);
+        pricePerToken = _pricePerToken;
+        liquidityPercent = _liquidityPercent;
+        buyerVesting = _buyerVesting;
     }
 
-    function buy(uint256 payAmount) external {
-        require(!finalized, "sale closed");
-        require(payAmount > 0, "zero pay");
+    function buy(uint256 amount) external nonReentrant {
+        require(amount > 0, "zero amount");
 
-        uint256 tokenAmount = (payAmount * 1e18) / price; // scaled calculation
-        require(sold + tokenAmount <= hardcap, "cap reached");
+        uint256 cost = amount * pricePerToken;
+        IERC20(usdc()).safeTransferFrom(msg.sender, treasury, cost);
 
-        paymentToken.safeTransferFrom(msg.sender, address(this), payAmount);
-        contributed[msg.sender] += payAmount;
-        allocated[msg.sender] += tokenAmount;
-        sold += tokenAmount;
+        BuyerInfo storage buyer = buyers[msg.sender];
+        buyer.amountBought += amount;
 
-        emit Bought(msg.sender, payAmount, tokenAmount);
-    }
-
-    function finalize(
-        uint256 liquidityTokenAmount,
-        uint256 liquidityPayAmount,
-        uint256 minTok,
-        uint256 minPay,
-        uint256 deadline
-    ) external onlyOwner {
-        require(!finalized, "already finalized");
-
-        // Transfer payment to vault
-        uint256 balance = paymentToken.balanceOf(address(this));
-        if (balance > 0) {
-            paymentToken.safeTransfer(vault, balance);
+        if (buyerVesting) {
+            buyer.startTime = block.timestamp;
+            buyer.endTime = block.timestamp + 30 days; // optional linear vesting
+        } else {
+            buyer.claimed += amount;
+            saleToken.safeTransfer(msg.sender, amount);
         }
 
-        // Optional liquidity add
-        if (autoAddLiquidity) {
-            require(token.balanceOf(address(this)) >= liquidityTokenAmount, "not enough token");
-            token.safeApprove(router, liquidityTokenAmount);
-            paymentToken.safeApprove(router, liquidityPayAmount);
-
-            IRouter(router).addLiquidity(
-                address(token),
-                address(paymentToken),
-                liquidityTokenAmount,
-                liquidityPayAmount,
-                minTok,
-                minPay,
-                projectOwner,
-                deadline
-            );
-            emit Finalized(liquidityTokenAmount, liquidityPayAmount);
-        }
-
-        finalized = true;
+        emit Purchased(msg.sender, amount);
     }
 
-    function claim() external {
-        require(finalized, "not finalized");
-        uint256 totalAllocated = allocated[msg.sender];
-        require(totalAllocated > 0, "no allocation");
+    function claim() external nonReentrant {
+        require(buyerVesting, "vesting not enabled");
+        BuyerInfo storage buyer = buyers[msg.sender];
+        uint256 claimable = _vestedAmount(buyer);
+        require(claimable > 0, "nothing to claim");
 
-        uint256 tgeAmount = (totalAllocated * tgePercent) / 100;
-        uint256 vestAmount = totalAllocated - tgeAmount;
-
-        allocated[msg.sender] = 0;
-        claimed[msg.sender] = vestAmount;
-
-        // Send TGE
-        if (tgeAmount > 0) {
-            token.safeTransfer(msg.sender, tgeAmount);
-        }
-
-        // Vesting (optional)
-        if (vestingDuration == 0 && vestAmount > 0) {
-            token.safeTransfer(msg.sender, vestAmount); // immediate if no vesting
-            claimed[msg.sender] = 0;
-        }
-        // If vesting exists, tokens remain in contract and can be claimed later
+        buyer.claimed += claimable;
+        saleToken.safeTransfer(msg.sender, claimable);
+        emit Claimed(msg.sender, claimable);
     }
 
-    function claimVested() external {
-        require(vestingDuration > 0, "no vesting configured");
-        uint256 vestBalance = claimed[msg.sender];
-        require(vestBalance > 0, "nothing to claim");
-
-        uint256 elapsed = block.timestamp - startTime;
-        uint256 claimable = (vestBalance * elapsed) / vestingDuration;
-        if (claimable > vestBalance) claimable = vestBalance;
-
-        claimed[msg.sender] -= claimable;
-        token.safeTransfer(msg.sender, claimable);
+    function _vestedAmount(BuyerInfo memory info) internal view returns (uint256) {
+        if (block.timestamp >= info.endTime) return info.amountBought - info.claimed;
+        uint256 duration = info.endTime - info.startTime;
+        uint256 elapsed = block.timestamp - info.startTime;
+        return ((info.amountBought * elapsed) / duration) - info.claimed;
     }
 
-    // Admin: fund contract with tokens for sale/vesting
-    function fundSale(uint256 tokenAmount) external {
-        token.safeTransferFrom(msg.sender, address(this), tokenAmount);
+    function lockLiquidity(uint256 tokenAmount, address lpToken) external onlyOwner {
+        require(tokenAmount > 0, "zero amount");
+        saleToken.safeTransfer(address(liquidityLocker), tokenAmount);
+        liquidityLocker.lockLP(lpToken, tokenAmount, vault); // mandatory
+    }
+
+    function usdc() public pure returns (address) {
+        return 0xYourUSDCAddress; // from .env
+    }
+
+    // Admin: update price
+    function setPrice(uint256 _price) external onlyOwner {
+        pricePerToken = _price;
     }
 }
