@@ -6,79 +6,44 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title LaunchpadFactory
- * @notice Deploy LaunchpadSale contracts for external projects.
- * - Vesting and auto liquidity are optional.
+ * @notice Deploys new LaunchpadSale contracts for any token
  */
 contract LaunchpadFactory is Ownable {
-    address public router;  // AtlasRouter address (for optional liquidity add)
-    address public vault;   // Platform treasury / fee sink
-    address[] public allSales;
+    address[] public sales;
+    address public vault;
+    address public liquidityLocker;
 
-    event SaleCreated(
-        address indexed creator,
-        address sale,
-        address vesting,
-        uint256 timestamp
-    );
+    event SaleCreated(address indexed creator, address saleContract);
 
-    constructor(address _router, address _vault) {
-        require(_router != address(0), "zero router");
-        require(_vault != address(0), "zero vault");
-        router = _router;
+    constructor(address _vault, address _liquidityLocker) {
+        require(_vault != address(0) && _liquidityLocker != address(0), "zero address");
         vault = _vault;
+        liquidityLocker = _liquidityLocker;
+    }
+
+    function createSale(
+        address token,
+        address treasury,
+        uint256 pricePerToken,
+        uint256 liquidityPercent,
+        bool buyerVesting
+    ) external onlyOwner returns (address) {
+        LaunchpadSale sale = new LaunchpadSale(
+            AtlasToken(token),
+            treasury,
+            vault,
+            liquidityLocker,
+            pricePerToken,
+            liquidityPercent,
+            buyerVesting
+        );
+        sale.transferOwnership(msg.sender);
+        sales.push(address(sale));
+        emit SaleCreated(msg.sender, address(sale));
+        return address(sale);
     }
 
     function allSalesLength() external view returns (uint256) {
-        return allSales.length;
-    }
-
-    /**
-     * @notice Create a sale for a token
-     * @param token Token being sold (project token)
-     * @param paymentToken Token used for payment (e.g., USDC)
-     * @param price Payment token per project token (scaled by paymentToken decimals)
-     * @param hardcap Total tokens allocated for sale
-     * @param tgePercent Percent released at TGE (0-100)
-     * @param vesting Duration of vesting in seconds (0 = no vesting)
-     * @param autoAddLiquidity Whether to add liquidity on finalize
-     */
-    function createSale(
-        address token,
-        address paymentToken,
-        uint256 price,
-        uint256 hardcap,
-        uint8 tgePercent,
-        uint256 vesting,
-        bool autoAddLiquidity
-    ) external returns (address sale, address vestingAddress) {
-        require(token != address(0) && paymentToken != address(0), "zero token");
-
-        // Deploy LaunchpadSale contract
-        LaunchpadSale s = new LaunchpadSale(
-            msg.sender,
-            token,
-            paymentToken,
-            price,
-            hardcap,
-            tgePercent,
-            vesting,
-            autoAddLiquidity,
-            router,
-            vault
-        );
-
-        sale = address(s);
-        vestingAddress = vesting > 0 ? address(s) : address(0); // Vesting handled internally
-
-        allSales.push(sale);
-        emit SaleCreated(msg.sender, sale, vestingAddress, block.timestamp);
-    }
-
-    function setRouter(address _router) external onlyOwner {
-        router = _router;
-    }
-
-    function setVault(address _vault) external onlyOwner {
-        vault = _vault;
+        return sales.length;
     }
 }
