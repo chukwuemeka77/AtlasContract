@@ -3,125 +3,159 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "../token/AtlasToken.sol";
 import "../utils/SafeERC20.sol";
 
 /**
  * @title LaunchPool
- * @notice Staking pool for any ERC20 token. Supports optional reward rate and mandatory liquidity lock.
+ * @notice Staking pool with optional reward rate
  */
 contract LaunchPool is Ownable, ReentrancyGuard {
-    using SafeERC20 for IERC20;
+    using SafeERC20 for AtlasToken;
 
-    IERC20 public stakeToken;     // token users stake (LP or ERC20)
-    IERC20 public rewardToken;    // reward token (Atlas or project token)
-    address public vault;         // treasury for fees
-
-    uint256 public accRewardPerShare; // accumulated reward per share, scaled by 1e12
-    uint256 public lastUpdate;         // last update timestamp
-    uint256 public rewardRatePerSecond; // optional reward emission rate
-
-    uint256 public totalStaked;
-
-    struct UserInfo {
-        uint256 amount;      // staked amount
-        uint256 rewardDebt;  // rewards owed
+    struct StakeInfo {
+        uint256 amount;
+        uint256 rewardDebt;
+        uint256 lastUpdated;
     }
 
-    mapping(address => UserInfo) public users;
+    AtlasToken public atlasToken;
+    uint256 public rewardRatePerSecond; // optional, can be zero
+    uint256 public startTime;
+    uint256 public endTime;
+    uint256 public totalStaked;
+
+    mapping(address => StakeInfo) public stakes;
 
     event Staked(address indexed user, uint256 amount);
-    event Unstaked(address indexed user, uint256 amount);
+    event Withdrawn(address indexed user, uint256 amount);
     event RewardClaimed(address indexed user, uint256 amount);
 
     constructor(
-        address _stakeToken,
-        address _rewardToken,
-        address _vault,
-        uint256 _rewardRatePerSecond
+        AtlasToken _atlasToken,
+        uint256 _rewardRatePerSecond,
+        uint256 _startTime,
+        uint256 _endTime,
+        address _admin
     ) {
-        require(_stakeToken != address(0) && _rewardToken != address(0) && _vault != address(0), "zero address");
-        stakeToken = IERC20(_stakeToken);
-        rewardToken = IERC20(_rewardToken);
-        vault = _vault;
+        require(address(_atlasToken) != address(0), "zero token");
+        require(_startTime < _endTime, "invalid time");
+
+        atlasToken = _atlasToken;
         rewardRatePerSecond = _rewardRatePerSecond;
-        lastUpdate = block.timestamp;
+        startTime = _startTime;
+        endTime = _endTime;
+
+        _transferOwnership(_admin);
     }
 
-    // Update pool rewards
-    function _updatePool() internal {
-        if (totalStaked > 0 && rewardRatePerSecond > 0) {
-            uint256 delta = block.timestamp - lastUpdate;
-            uint256 reward = delta * rewardRatePerSecond;
-            accRewardPerShare += (reward * 1e12) / totalStaked;
-        }
-        lastUpdate = block.timestamp;
-    }
-
-    // Stake tokens
+    /**
+     * @notice Stake Atlas tokens into the pool
+     * @param amount Amount of tokens to stake
+     */
     function stake(uint256 amount) external nonReentrant {
+        require(block.timestamp >= startTime && block.timestamp <= endTime, "pool not active");
         require(amount > 0, "zero amount");
-        UserInfo storage user = users[msg.sender];
-        _updatePool();
 
+        StakeInfo storage user = stakes[msg.sender];
+
+        // Update pending rewards before adding more stake
         if (user.amount > 0) {
-            uint256 pending = (user.amount * accRewardPerShare) / 1e12 - user.rewardDebt;
-            if (pending > 0) rewardToken.safeTransfer(msg.sender, pending);
+            uint256 pending = _pendingReward(msg.sender);
+            if (pending > 0) {
+                atlasToken.safeTransfer(msg.sender, pending);
+                emit RewardClaimed(msg.sender, pending);
+            }
         }
 
-        stakeToken.safeTransferFrom(msg.sender, address(this), amount);
+        atlasToken.safeTransferFrom(msg.sender, address(this), amount);
         user.amount += amount;
+        user.lastUpdated = block.timestamp;
         totalStaked += amount;
-        user.rewardDebt = (user.amount * accRewardPerShare) / 1e12;
 
         emit Staked(msg.sender, amount);
     }
 
-    // Unstake tokens
-    function unstake(uint256 amount) external nonReentrant {
-        UserInfo storage user = users[msg.sender];
-        require(user.amount >= amount, "insufficient balance");
-        _updatePool();
+    /**
+     * @notice Withdraw staked tokens + rewards
+     * @param amount Amount to withdraw
+     */
+    function withdraw(uint256 amount) external nonReentrant {
+        StakeInfo storage user = stakes[msg.sender];
+        require(user.amount >= amount, "not enough staked");
 
-        uint256 pending = (user.amount * accRewardPerShare) / 1e12 - user.rewardDebt;
-        if (pending > 0) rewardToken.safeTransfer(msg.sender, pending);
+        uint256 pending = _pendingReward(msg.sender);
 
-        user.amount -= amount;
-        totalStaked -= amount;
-        stakeToken.safeTransfer(msg.sender, amount);
+        if (pending > 0) {
+            atlasToken.safeTransfer(msg.sender, pending);
+            emit RewardClaimed(msg.sender, pending);
+        }
 
-        user.rewardDebt = (user.amount * accRewardPerShare) / 1e12;
+        if (amount > 0) {
+            user.amount -= amount;
+            atlasToken.safeTransfer(msg.sender, amount);
+            totalStaked -= amount;
+            emit Withdrawn(msg.sender, amount);
+        }
 
-        emit Unstaked(msg.sender, amount);
+        user.lastUpdated = block.timestamp;
     }
 
-    // Claim rewards without unstaking
-    function claim() external nonReentrant {
-        UserInfo storage user = users[msg.sender];
-        _updatePool();
-
-        uint256 pending = (user.amount * accRewardPerShare) / 1e12 - user.rewardDebt;
+    /**
+     * @notice Claim only the rewards without withdrawing
+     */
+    function claimRewards() external nonReentrant {
+        uint256 pending = _pendingReward(msg.sender);
         require(pending > 0, "no rewards");
 
-        rewardToken.safeTransfer(msg.sender, pending);
-        user.rewardDebt = (user.amount * accRewardPerShare) / 1e12;
+        stakes[msg.sender].lastUpdated = block.timestamp;
+        atlasToken.safeTransfer(msg.sender, pending);
 
         emit RewardClaimed(msg.sender, pending);
     }
 
-    // Admin: fund rewards
-    function fund(uint256 amount) external onlyOwner {
-        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+    /**
+     * @notice Compute pending reward for a user
+     */
+    function _pendingReward(address userAddr) internal view returns (uint256) {
+        StakeInfo memory user = stakes[userAddr];
+
+        if (rewardRatePerSecond == 0 || user.amount == 0) {
+            return 0;
+        }
+
+        uint256 lastTime = user.lastUpdated;
+        if (block.timestamp < startTime) {
+            return 0;
+        }
+
+        uint256 applicableEnd = block.timestamp > endTime ? endTime : block.timestamp;
+        uint256 duration = applicableEnd - lastTime;
+
+        return user.amount * rewardRatePerSecond * duration / 1e18; // scaled by 1e18
     }
 
-    // Admin: adjust reward rate
-    function setRewardRate(uint256 rate) external onlyOwner {
-        _updatePool();
-        rewardRatePerSecond = rate;
+    /**
+     * @notice Update the reward rate (optional, can be zero)
+     */
+    function setRewardRate(uint256 _rewardRatePerSecond) external onlyOwner {
+        rewardRatePerSecond = _rewardRatePerSecond;
     }
 
-    // Admin: emergency withdraw for vault (e.g., team/founder staking)
-    function emergencyWithdraw(uint256 amount) external onlyOwner {
-        require(amount <= rewardToken.balanceOf(address(this)), "insufficient balance");
-        rewardToken.safeTransfer(vault, amount);
+    /**
+     * @notice Emergency withdraw without rewards
+     */
+    function emergencyWithdraw() external nonReentrant {
+        StakeInfo storage user = stakes[msg.sender];
+        uint256 staked = user.amount;
+        require(staked > 0, "nothing to withdraw");
+
+        user.amount = 0;
+        user.rewardDebt = 0;
+        user.lastUpdated = block.timestamp;
+        totalStaked -= staked;
+
+        atlasToken.safeTransfer(msg.sender, staked);
+        emit Withdrawn(msg.sender, staked);
     }
 }
