@@ -2,92 +2,136 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/**
- * @title MultiTokenPair
- * @notice Pair contract for liquidity provision and swaps between any two ERC20 tokens
- */
-contract MultiTokenPair is ERC20, Ownable, ReentrancyGuard {
+contract MultiTokenPair {
+    using SafeERC20 for IERC20;
+
     address public token0;
     address public token1;
+    address public vaultAdmin; // Fee recipient
 
     uint256 public reserve0;
     uint256 public reserve1;
 
-    uint256 public constant FEE_RATE = 30; // 0.3% fee
-    uint256 public constant FEE_DENOMINATOR = 10000;
+    uint256 public constant FEE_DENOMINATOR = 100; // Percent-based fees
 
-    event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to);
-    event LiquidityAdded(address indexed provider, uint256 amount0, uint256 amount1, uint256 liquidity);
-    event LiquidityRemoved(address indexed provider, uint256 amount0, uint256 amount1, uint256 liquidity);
+    uint256 public swapFeeRewardPercent;  // e.g., 30
+    uint256 public swapFeeTreasuryPercent; // e.g., 70
 
-    constructor() ERC20("MultiToken-LP", "MTLP") {}
+    mapping(address => uint256) public liquidity; // LP shares
+    uint256 public totalLiquidity;
 
-    function initialize(address _token0, address _token1) external onlyOwner {
-        require(token0 == address(0) && token1 == address(0), "Already initialized");
+    event LiquidityAdded(address indexed provider, uint256 amount0, uint256 amount1, uint256 liquidityMinted);
+    event LiquidityRemoved(address indexed provider, uint256 amount0, uint256 amount1, uint256 liquidityBurned);
+    event Swapped(address indexed user, address inputToken, uint256 inputAmount, address outputToken, uint256 outputAmount);
+
+    constructor(address _token0, address _token1, address _vaultAdmin) {
+        require(_token0 != _token1, "Identical tokens");
+        require(_vaultAdmin != address(0), "Invalid vault admin");
+
         token0 = _token0;
         token1 = _token1;
+        vaultAdmin = _vaultAdmin;
+
+        // Default fees, can be modified via external setter if needed
+        swapFeeRewardPercent = 30;
+        swapFeeTreasuryPercent = 70;
     }
 
-    function addLiquidity(uint256 amount0, uint256 amount1) external nonReentrant returns (uint256 liquidity) {
-        IERC20(token0).transferFrom(msg.sender, address(this), amount0);
-        IERC20(token1).transferFrom(msg.sender, address(this), amount1);
+    /**
+     * @notice Add liquidity to the pool
+     */
+    function addLiquidity(uint256 amount0, uint256 amount1) external returns (uint256 liquidityMinted) {
+        require(amount0 > 0 && amount1 > 0, "Zero amount");
 
-        if (totalSupply() == 0) {
-            liquidity = sqrt(amount0 * amount1);
+        IERC20(token0).safeTransferFrom(msg.sender, address(this), amount0);
+        IERC20(token1).safeTransferFrom(msg.sender, address(this), amount1);
+
+        if (totalLiquidity == 0) {
+            liquidityMinted = sqrt(amount0 * amount1);
         } else {
-            liquidity = min((amount0 * totalSupply()) / reserve0, (amount1 * totalSupply()) / reserve1);
+            liquidityMinted = min((amount0 * totalLiquidity) / reserve0, (amount1 * totalLiquidity) / reserve1);
         }
-        _mint(msg.sender, liquidity);
 
-        _updateReserves();
-        emit LiquidityAdded(msg.sender, amount0, amount1, liquidity);
+        liquidity[msg.sender] += liquidityMinted;
+        totalLiquidity += liquidityMinted;
+
+        reserve0 += amount0;
+        reserve1 += amount1;
+
+        emit LiquidityAdded(msg.sender, amount0, amount1, liquidityMinted);
     }
 
-    function removeLiquidity(uint256 liquidity) external nonReentrant returns (uint256 amount0, uint256 amount1) {
-        amount0 = (liquidity * reserve0) / totalSupply();
-        amount1 = (liquidity * reserve1) / totalSupply();
-        _burn(msg.sender, liquidity);
+    /**
+     * @notice Remove liquidity from the pool
+     */
+    function removeLiquidity(uint256 liquidityAmount) external returns (uint256 amount0, uint256 amount1) {
+        require(liquidity[msg.sender] >= liquidityAmount, "Insufficient liquidity");
 
-        IERC20(token0).transfer(msg.sender, amount0);
-        IERC20(token1).transfer(msg.sender, amount1);
+        amount0 = (liquidityAmount * reserve0) / totalLiquidity;
+        amount1 = (liquidityAmount * reserve1) / totalLiquidity;
 
-        _updateReserves();
-        emit LiquidityRemoved(msg.sender, amount0, amount1, liquidity);
+        liquidity[msg.sender] -= liquidityAmount;
+        totalLiquidity -= liquidityAmount;
+
+        reserve0 -= amount0;
+        reserve1 -= amount1;
+
+        IERC20(token0).safeTransfer(msg.sender, amount0);
+        IERC20(token1).safeTransfer(msg.sender, amount1);
+
+        emit LiquidityRemoved(msg.sender, amount0, amount1, liquidityAmount);
     }
 
-    function swap(uint256 amount0Out, uint256 amount1Out, address to) external nonReentrant {
-        require(amount0Out > 0 || amount1Out > 0, "Zero output");
-        require(amount0Out < reserve0 && amount1Out < reserve1, "Insufficient liquidity");
+    /**
+     * @notice Swap exact input token for output token
+     */
+    function swap(address inputToken, uint256 inputAmount) external returns (uint256 outputAmount) {
+        require(inputToken == token0 || inputToken == token1, "Invalid token");
+        require(inputAmount > 0, "Zero amount");
 
-        if (amount0Out > 0) IERC20(token0).transfer(to, amount0Out);
-        if (amount1Out > 0) IERC20(token1).transfer(to, amount1Out);
+        bool isToken0 = inputToken == token0;
+        address outputToken = isToken0 ? token1 : token0;
 
-        uint256 balance0 = IERC20(token0).balanceOf(address(this));
-        uint256 balance1 = IERC20(token1).balanceOf(address(this));
+        uint256 reserveInput = isToken0 ? reserve0 : reserve1;
+        uint256 reserveOutput = isToken0 ? reserve1 : reserve0;
 
-        uint256 amount0In = balance0 > reserve0 - amount0Out ? balance0 - (reserve0 - amount0Out) : 0;
-        uint256 amount1In = balance1 > reserve1 - amount1Out ? balance1 - (reserve1 - amount1Out) : 0;
+        // Calculate fees
+        uint256 feeReward = (inputAmount * swapFeeRewardPercent) / FEE_DENOMINATOR;
+        uint256 feeTreasury = (inputAmount * swapFeeTreasuryPercent) / FEE_DENOMINATOR;
+        uint256 amountAfterFee = inputAmount - feeReward - feeTreasury;
 
-        require(amount0In > 0 || amount1In > 0, "Insufficient input");
+        // Update reserves
+        if (isToken0) {
+            reserve0 += inputAmount;
+        } else {
+            reserve1 += inputAmount;
+        }
 
-        // Apply fee
-        uint256 fee0 = (amount0In * FEE_RATE) / FEE_DENOMINATOR;
-        uint256 fee1 = (amount1In * FEE_RATE) / FEE_DENOMINATOR;
-        reserve0 = balance0 - fee0;
-        reserve1 = balance1 - fee1;
+        // Constant product formula: x * y = k
+        outputAmount = (amountAfterFee * reserveOutput) / (reserveInput + amountAfterFee);
 
-        emit Swap(msg.sender, amount0In, amount1In, amount0Out, amount1Out, to);
+        // Transfer input
+        IERC20(inputToken).safeTransferFrom(msg.sender, address(this), inputAmount);
+
+        // Transfer output
+        IERC20(outputToken).safeTransfer(msg.sender, outputAmount);
+
+        // Send treasury fees
+        IERC20(inputToken).safeTransfer(vaultAdmin, feeTreasury);
+
+        emit Swapped(msg.sender, inputToken, inputAmount, outputToken, outputAmount);
+
+        // Update reserves
+        if (isToken0) {
+            reserve1 -= outputAmount;
+        } else {
+            reserve0 -= outputAmount;
+        }
     }
 
-    function _updateReserves() internal {
-        reserve0 = IERC20(token0).balanceOf(address(this));
-        reserve1 = IERC20(token1).balanceOf(address(this));
-    }
-
+    /** @notice Utility functions */
     function sqrt(uint y) internal pure returns (uint z) {
         if (y > 3) {
             z = y;
@@ -101,7 +145,7 @@ contract MultiTokenPair is ERC20, Ownable, ReentrancyGuard {
         }
     }
 
-    function min(uint x, uint y) internal pure returns (uint) {
+    function min(uint256 x, uint256 y) internal pure returns (uint256) {
         return x < y ? x : y;
     }
 }
