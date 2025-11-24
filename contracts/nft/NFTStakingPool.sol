@@ -2,80 +2,87 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /**
  * @title NFTStakingPool
- * @notice Stake NFTs to earn ERC20 rewards (e.g., Atlas)
+ * @notice Allows users to stake ERC20 tokens and earn rewards
  */
 contract NFTStakingPool is Ownable, ReentrancyGuard {
+    IERC20 public stakingToken;
     IERC20 public rewardToken;
-    IERC721 public nftCollection;
-    uint256 public rewardRatePerSecond; // reward per NFT per second
 
-    struct Stake {
-        uint256 tokenId;
-        uint256 stakedAt;
-        address owner;
+    struct StakeInfo {
+        uint256 amount;
+        uint256 rewardDebt;
+        uint256 lastStakedTime;
     }
 
-    mapping(uint256 => Stake) public stakes;
-    mapping(address => uint256[]) public userStakes;
+    mapping(address => StakeInfo) public stakes;
+    uint256 public accRewardPerShare;
+    uint256 public totalStaked;
+    uint256 public rewardRatePerSecond;
 
-    event NFTStaked(address indexed user, uint256 tokenId);
-    event NFTUnstaked(address indexed user, uint256 tokenId, uint256 rewardClaimed);
+    event Staked(address indexed user, uint256 amount);
+    event Unstaked(address indexed user, uint256 amount);
+    event RewardClaimed(address indexed user, uint256 reward);
 
-    constructor(IERC20 _rewardToken, IERC721 _nftCollection, uint256 _rewardRatePerSecond) {
+    constructor(
+        IERC20 _stakingToken,
+        IERC20 _rewardToken,
+        uint256 _rewardRatePerSecond
+    ) {
+        stakingToken = _stakingToken;
         rewardToken = _rewardToken;
-        nftCollection = _nftCollection;
         rewardRatePerSecond = _rewardRatePerSecond;
     }
 
-    /**
-     * @notice Stake NFTs
-     */
-    function stake(uint256[] calldata tokenIds) external nonReentrant {
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            uint256 tid = tokenIds[i];
-            require(nftCollection.ownerOf(tid) == msg.sender, "Not owner");
-            nftCollection.transferFrom(msg.sender, address(this), tid);
+    function stake(uint256 amount) external nonReentrant {
+        StakeInfo storage user = stakes[msg.sender];
+        _updateRewards(msg.sender);
 
-            stakes[tid] = Stake(tid, block.timestamp, msg.sender);
-            userStakes[msg.sender].push(tid);
+        stakingToken.transferFrom(msg.sender, address(this), amount);
+        user.amount += amount;
+        user.lastStakedTime = block.timestamp;
+        totalStaked += amount;
 
-            emit NFTStaked(msg.sender, tid);
-        }
+        emit Staked(msg.sender, amount);
     }
 
-    /**
-     * @notice Unstake NFTs and claim rewards
-     */
-    function unstake(uint256[] calldata tokenIds) external nonReentrant {
-        uint256 totalReward = 0;
+    function unstake(uint256 amount) external nonReentrant {
+        StakeInfo storage user = stakes[msg.sender];
+        require(user.amount >= amount, "Insufficient staked");
 
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            Stake memory s = stakes[tokenIds[i]];
-            require(s.owner == msg.sender, "Not staker");
+        _updateRewards(msg.sender);
 
-            uint256 reward = (block.timestamp - s.stakedAt) * rewardRatePerSecond;
-            totalReward += reward;
+        user.amount -= amount;
+        totalStaked -= amount;
+        stakingToken.transfer(msg.sender, amount);
 
-            delete stakes[tokenIds[i]];
-            nftCollection.transferFrom(address(this), msg.sender, tokenIds[i]);
-
-            emit NFTUnstaked(msg.sender, tokenIds[i], reward);
-        }
-
-        if (totalReward > 0) {
-            rewardToken.transfer(msg.sender, totalReward);
-        }
+        emit Unstaked(msg.sender, amount);
     }
 
-    /**
-     * @notice Update reward rate
-     */
+    function claimReward() external nonReentrant {
+        _updateRewards(msg.sender);
+        StakeInfo storage user = stakes[msg.sender];
+        uint256 pending = user.rewardDebt;
+        require(pending > 0, "No reward");
+
+        user.rewardDebt = 0;
+        rewardToken.transfer(msg.sender, pending);
+        emit RewardClaimed(msg.sender, pending);
+    }
+
+    function _updateRewards(address userAddr) internal {
+        StakeInfo storage user = stakes[userAddr];
+        if (user.amount > 0) {
+            uint256 pending = (block.timestamp - user.lastStakedTime) * rewardRatePerSecond * user.amount / 1e18;
+            user.rewardDebt += pending;
+        }
+        user.lastStakedTime = block.timestamp;
+    }
+
     function setRewardRate(uint256 _rewardRatePerSecond) external onlyOwner {
         rewardRatePerSecond = _rewardRatePerSecond;
     }
