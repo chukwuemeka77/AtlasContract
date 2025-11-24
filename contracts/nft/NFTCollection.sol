@@ -3,75 +3,60 @@ pragma solidity ^0.8.24;
 
 import "erc721a/contracts/ERC721A.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
  * @title NFTCollection
- * @notice A standard ERC721A NFT collection
+ * @notice Standard ERC721A NFT collection for launchpad sales
  */
 contract NFTCollection is ERC721A, Ownable {
-    using Strings for uint256;
-
     string public baseURI;
     uint256 public maxSupply;
-    uint256 public price;
-    bool public saleActive = false;
+    uint256 public mintPrice;
+    address public treasury;
+
+    event NFTMinted(address indexed user, uint256 tokenId);
 
     constructor(
         string memory _name,
         string memory _symbol,
         string memory _baseURI,
         uint256 _maxSupply,
-        uint256 _price
+        uint256 _mintPrice,
+        address _treasury
     ) ERC721A(_name, _symbol) {
         baseURI = _baseURI;
         maxSupply = _maxSupply;
-        price = _price;
+        mintPrice = _mintPrice;
+        treasury = _treasury;
     }
 
-    modifier saleIsActive() {
-        require(saleActive, "Sale not active");
-        _;
-    }
-
-    /**
-     * @notice Mint NFTs
-     * @param quantity Number of NFTs to mint
-     */
-    function mint(uint256 quantity) external payable saleIsActive {
+    function mint(uint256 quantity) external payable {
         require(totalSupply() + quantity <= maxSupply, "Exceeds max supply");
-        require(msg.value >= price * quantity, "Insufficient ETH");
+        require(msg.value >= quantity * mintPrice, "Insufficient ETH");
 
-        _safeMint(msg.sender, quantity);
+        _mint(msg.sender, quantity);
+
+        // forward ETH to treasury
+        payable(treasury).transfer(msg.value);
+
+        for (uint256 i = 0; i < quantity; i++) {
+            emit NFTMinted(msg.sender, totalSupply() - quantity + i + 1);
+        }
     }
 
-    /**
-     * @notice Set the base URI for token metadata
-     */
     function setBaseURI(string memory _baseURI) external onlyOwner {
         baseURI = _baseURI;
     }
 
-    /**
-     * @notice Toggle sale status
-     */
-    function toggleSale() external onlyOwner {
-        saleActive = !saleActive;
+    function setMintPrice(uint256 _mintPrice) external onlyOwner {
+        mintPrice = _mintPrice;
     }
 
-    /**
-     * @notice Withdraw contract balance
-     */
-    function withdraw() external onlyOwner {
-        payable(owner()).transfer(address(this).balance);
+    function setTreasury(address _treasury) external onlyOwner {
+        treasury = _treasury;
     }
 
     function _baseURI() internal view override returns (string memory) {
         return baseURI;
-    }
-
-    function tokenURI(uint256 tokenId) public view override returns (string memory) {
-        require(_exists(tokenId), "Nonexistent token");
-        return string(abi.encodePacked(_baseURI(), tokenId.toString(), ".json"));
     }
 }
