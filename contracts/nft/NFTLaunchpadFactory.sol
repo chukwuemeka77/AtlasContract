@@ -1,35 +1,35 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "./NFTCollection.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "./NFTCollection.sol";
 
-/**
- * @title NFTLaunchpadFactory
- * @notice Factory to deploy NFT collections for launchpad sales
- */
 contract NFTLaunchpadFactory is Ownable {
-    address[] public allCollections;
+    NFTCollection[] public collections;
+    address public treasury; // funds go here
 
-    event CollectionCreated(address indexed collection, string name, string symbol, uint256 maxSupply, uint256 mintPrice);
+    event NFTCollectionCreated(address indexed collection, address indexed owner, string name, string symbol);
 
-    function createCollection(
+    constructor(address _treasury) {
+        treasury = _treasury;
+    }
+
+    function createNFTCollection(
         string memory name,
         string memory symbol,
         string memory baseURI,
-        uint256 maxSupply,
-        uint256 mintPrice,
-        address treasury
-    ) external onlyOwner returns (address collection) {
-        NFTCollection nft = new NFTCollection(name, symbol, baseURI, maxSupply, mintPrice, treasury);
-        collection = address(nft);
-        allCollections.push(collection);
-
-        emit CollectionCreated(collection, name, symbol, maxSupply, mintPrice);
+        uint256 maxSupply
+    ) external {
+        NFTCollection nft = new NFTCollection(name, symbol, baseURI, maxSupply, msg.sender);
+        collections.push(nft);
+        emit NFTCollectionCreated(address(nft), msg.sender, name, symbol);
     }
 
-    function allCollectionsLength() external view returns (uint256) {
-        return allCollections.length;
+    function getCollections() external view returns (NFTCollection[] memory) {
+        return collections;
+    }
+
+    function setTreasury(address _treasury) external onlyOwner {
+        treasury = _treasury;
     }
 }
-
