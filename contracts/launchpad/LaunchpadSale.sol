@@ -4,16 +4,6 @@ pragma solidity ^0.8.24;
 import "../utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-interface IVesting {
-    function setVestingSchedule(
-        address beneficiary,
-        uint256 totalAmount,
-        uint256 start,
-        uint256 cliff,
-        uint256 duration
-    ) external;
-}
-
 interface IRouter {
     function addLiquidity(
         address tokenA,
@@ -27,32 +17,27 @@ interface IRouter {
     ) external returns (uint, uint, uint);
 }
 
-/**
- * @title LaunchpadSale
- * @notice Token sale contract for projects using Atlas Launchpad.
- * - Vesting is mandatory
- * - Liquidity add is mandatory on finalize
- */
 contract LaunchpadSale is Ownable {
     using SafeERC20 for IERC20;
 
-    IERC20 public token;           // Token being sold
-    IERC20 public paymentToken;    // USDC/WETH/etc.
-
-    address public projectOwner;   // Project owner
-    uint256 public price;          // paymentToken per token (scaled)
-    uint256 public hardcap;        // Max tokens for sale
-    uint256 public sold;           // Tokens sold
-
-    uint8 public tgePercent;       // % released at TGE
-    address public vesting;        // Vesting contract (mandatory)
-
-    address public router;         // AtlasRouter
-    address public vault;          // Vault admin
-    bool public finalized;         // Sale finalized
+    IERC20 public token;
+    IERC20 public paymentToken;
+    address public projectOwner;
+    uint256 public price;          // paymentToken per token
+    uint256 public hardcap;        // max tokens for sale
+    uint256 public sold;           // total tokens sold
+    uint8 public tgePercent;       // percent released at TGE
+    uint256 public vestingDuration; // optional vesting
+    bool public autoAddLiquidity;   // optional liquidity add
+    address public router;           // router address for liquidity
+    address public vault;            // treasury address
+    bool public finalized;
 
     mapping(address => uint256) public contributed;
     mapping(address => uint256) public allocated;
+    mapping(address => uint256) public claimed; // track claimed tokens for vesting
+
+    uint256 public startTime;
 
     event Bought(address indexed buyer, uint256 payAmount, uint256 tokenAmount);
     event Finalized(uint256 liquidityToken, uint256 liquidityPayment);
@@ -64,15 +49,14 @@ contract LaunchpadSale is Ownable {
         uint256 _price,
         uint256 _hardcap,
         uint8 _tgePercent,
-        address _vesting,
+        uint256 _vestingDuration,
+        bool _autoAddLiquidity,
         address _router,
         address _vault
     ) {
-        require(_owner != address(0), "LaunchpadSale: zero owner");
-        require(_token != address(0) && _paymentToken != address(0), "LaunchpadSale: zero token");
-        require(_vesting != address(0), "LaunchpadSale: vesting required");
-        require(_router != address(0), "LaunchpadSale: router required");
-        require(_vault != address(0), "LaunchpadSale: vault required");
+        require(_owner != address(0), "zero owner");
+        require(_token != address(0), "zero token");
+        require(_paymentToken != address(0), "zero payment");
 
         projectOwner = _owner;
         token = IERC20(_token);
@@ -80,20 +64,21 @@ contract LaunchpadSale is Ownable {
         price = _price;
         hardcap = _hardcap;
         tgePercent = _tgePercent;
-        vesting = _vesting;
+        vestingDuration = _vestingDuration;
+        autoAddLiquidity = _autoAddLiquidity;
         router = _router;
         vault = _vault;
 
         _transferOwnership(_owner);
+        startTime = block.timestamp;
     }
 
-    /// @notice Buy tokens from the sale
     function buy(uint256 payAmount) external {
-        require(!finalized, "LaunchpadSale: sale closed");
-        require(payAmount > 0, "LaunchpadSale: zero payment");
+        require(!finalized, "sale closed");
+        require(payAmount > 0, "zero pay");
 
-        uint256 tokenAmount = (payAmount * 1e18) / price;
-        require(sold + tokenAmount <= hardcap, "LaunchpadSale: hardcap reached");
+        uint256 tokenAmount = (payAmount * 1e18) / price; // scaled calculation
+        require(sold + tokenAmount <= hardcap, "cap reached");
 
         paymentToken.safeTransferFrom(msg.sender, address(this), payAmount);
         contributed[msg.sender] += payAmount;
@@ -103,11 +88,6 @@ contract LaunchpadSale is Ownable {
         emit Bought(msg.sender, payAmount, tokenAmount);
     }
 
-    /**
-     * @notice Finalize the sale
-     * - Transfer all payments to vault
-     * - Must add liquidity to AtlasRouter
-     */
     function finalize(
         uint256 liquidityTokenAmount,
         uint256 liquidityPayAmount,
@@ -115,53 +95,75 @@ contract LaunchpadSale is Ownable {
         uint256 minPay,
         uint256 deadline
     ) external onlyOwner {
-        require(!finalized, "LaunchpadSale: already finalized");
+        require(!finalized, "already finalized");
 
-        // Transfer all payments to vault
+        // Transfer payment to vault
         uint256 balance = paymentToken.balanceOf(address(this));
         if (balance > 0) {
             paymentToken.safeTransfer(vault, balance);
         }
 
-        // Add liquidity (mandatory)
-        require(token.balanceOf(address(this)) >= liquidityTokenAmount, "LaunchpadSale: insufficient token");
-        token.safeApprove(router, liquidityTokenAmount);
-        paymentToken.safeApprove(router, liquidityPayAmount);
+        // Optional liquidity add
+        if (autoAddLiquidity) {
+            require(token.balanceOf(address(this)) >= liquidityTokenAmount, "not enough token");
+            token.safeApprove(router, liquidityTokenAmount);
+            paymentToken.safeApprove(router, liquidityPayAmount);
 
-        IRouter(router).addLiquidity(
-            address(token),
-            address(paymentToken),
-            liquidityTokenAmount,
-            liquidityPayAmount,
-            minTok,
-            minPay,
-            projectOwner,
-            deadline
-        );
+            IRouter(router).addLiquidity(
+                address(token),
+                address(paymentToken),
+                liquidityTokenAmount,
+                liquidityPayAmount,
+                minTok,
+                minPay,
+                projectOwner,
+                deadline
+            );
+            emit Finalized(liquidityTokenAmount, liquidityPayAmount);
+        }
 
-        emit Finalized(liquidityTokenAmount, liquidityPayAmount);
         finalized = true;
     }
 
-    /// @notice Claim allocated tokens (TGE + vesting)
     function claim() external {
-        require(finalized, "LaunchpadSale: not finalized");
-        uint256 amount = allocated[msg.sender];
-        require(amount > 0, "LaunchpadSale: no allocation");
+        require(finalized, "not finalized");
+        uint256 totalAllocated = allocated[msg.sender];
+        require(totalAllocated > 0, "no allocation");
+
+        uint256 tgeAmount = (totalAllocated * tgePercent) / 100;
+        uint256 vestAmount = totalAllocated - tgeAmount;
 
         allocated[msg.sender] = 0;
+        claimed[msg.sender] = vestAmount;
 
-        // TGE allocation
-        uint256 tgeAmount = (amount * tgePercent) / 100;
-        token.safeTransfer(msg.sender, tgeAmount);
+        // Send TGE
+        if (tgeAmount > 0) {
+            token.safeTransfer(msg.sender, tgeAmount);
+        }
 
-        // Vesting remainder (mandatory)
-        uint256 rest = amount - tgeAmount;
-        IVesting(vesting).setVestingSchedule(msg.sender, rest, block.timestamp, 0, 30 days);
+        // Vesting (optional)
+        if (vestingDuration == 0 && vestAmount > 0) {
+            token.safeTransfer(msg.sender, vestAmount); // immediate if no vesting
+            claimed[msg.sender] = 0;
+        }
+        // If vesting exists, tokens remain in contract and can be claimed later
     }
 
-    /// @notice Fund sale with tokens
-    function fundSale(uint256 tokenAmount) external onlyOwner {
+    function claimVested() external {
+        require(vestingDuration > 0, "no vesting configured");
+        uint256 vestBalance = claimed[msg.sender];
+        require(vestBalance > 0, "nothing to claim");
+
+        uint256 elapsed = block.timestamp - startTime;
+        uint256 claimable = (vestBalance * elapsed) / vestingDuration;
+        if (claimable > vestBalance) claimable = vestBalance;
+
+        claimed[msg.sender] -= claimable;
+        token.safeTransfer(msg.sender, claimable);
+    }
+
+    // Admin: fund contract with tokens for sale/vesting
+    function fundSale(uint256 tokenAmount) external {
         token.safeTransferFrom(msg.sender, address(this), tokenAmount);
     }
 }
