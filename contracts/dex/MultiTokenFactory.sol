@@ -5,56 +5,71 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./MultiTokenPair.sol";
 
-contract MultiTokenFactory is Ownable {
-    address public vaultAdmin; // Fee recipient
-    address[] public allPairs;
+interface IAtlasToken is IERC20 {}
 
-    // Mapping to quickly find existing pair
-    mapping(address => mapping(address => address)) public getPair;
+contract MultiTokenFactory is Ownable {
+    // ---------------------------------------
+    // State
+    // ---------------------------------------
+    IAtlasToken public immutable atlasToken; // Rewards token
+    uint256 public immutable minLockDuration; // From .env / deployment
+
+    // All pairs deployed
+    MultiTokenPair[] public allPairs;
+
+    // Pair mapping: tokenA => tokenB => pair
+    mapping(address => mapping(address => MultiTokenPair)) public getPair;
 
     // Events
-    event PairCreated(address indexed token0, address indexed token1, address pair, uint256);
+    event PairCreated(address indexed tokenA, address indexed tokenB, address pair, uint256 totalPairs);
 
-    constructor(address _vaultAdmin) {
-        require(_vaultAdmin != address(0), "Invalid vault admin address");
-        vaultAdmin = _vaultAdmin;
+    // ---------------------------------------
+    // Constructor
+    // ---------------------------------------
+    constructor(IAtlasToken _atlasToken, uint256 _minLockDuration) {
+        require(address(_atlasToken) != address(0), "Invalid Atlas token");
+        atlasToken = _atlasToken;
+        minLockDuration = _minLockDuration;
     }
 
-    /**
-     * @notice Creates a new token pair
-     * @param tokenA Address of first token
-     * @param tokenB Address of second token
-     * @return pair Address of the newly created pair
-     */
-    function createPair(address tokenA, address tokenB) external onlyOwner returns (address pair) {
-        require(tokenA != tokenB, "Identical addresses");
-        require(tokenA != address(0) && tokenB != address(0), "Zero address");
-        require(getPair[tokenA][tokenB] == address(0), "Pair exists");
+    // ---------------------------------------
+    // Deploy a new MultiTokenPair
+    // ---------------------------------------
+    function createPair(
+        IERC20 tokenA,
+        IERC20 tokenB,
+        uint256 rewardRatePerSecond // optional reward rate per second for this pool
+    ) external onlyOwner returns (MultiTokenPair pair) {
+        require(address(tokenA) != address(tokenB), "Identical tokens");
+        require(address(tokenA) != address(0) && address(tokenB) != address(0), "Zero address");
+        require(address(getPair[address(tokenA)][address(tokenB)]) == address(0), "Pair exists");
 
-        // Deploy new pair contract
-        MultiTokenPair newPair = new MultiTokenPair(tokenA, tokenB, vaultAdmin);
-        pair = address(newPair);
+        pair = new MultiTokenPair(
+            tokenA,
+            tokenB,
+            atlasToken,
+            minLockDuration,
+            rewardRatePerSecond
+        );
 
-        // Store pair
-        getPair[tokenA][tokenB] = pair;
-        getPair[tokenB][tokenA] = pair;
         allPairs.push(pair);
+        getPair[address(tokenA)][address(tokenB)] = pair;
+        getPair[address(tokenB)][address(tokenA)] = pair; // bi-directional
 
-        emit PairCreated(tokenA, tokenB, pair, allPairs.length);
+        emit PairCreated(address(tokenA), address(tokenB), address(pair), allPairs.length);
     }
 
-    /**
-     * @notice Returns the total number of pairs
-     */
+    // ---------------------------------------
+    // View total pairs
+    // ---------------------------------------
     function allPairsLength() external view returns (uint256) {
         return allPairs.length;
     }
 
-    /**
-     * @notice Updates the vault admin address
-     */
-    function setVaultAdmin(address _vaultAdmin) external onlyOwner {
-        require(_vaultAdmin != address(0), "Invalid vault admin");
-        vaultAdmin = _vaultAdmin;
+    // ---------------------------------------
+    // Admin: recover accidentally sent ERC20s
+    // ---------------------------------------
+    function recoverToken(IERC20 token, uint256 amount) external onlyOwner {
+        token.transfer(owner(), amount);
     }
 }
