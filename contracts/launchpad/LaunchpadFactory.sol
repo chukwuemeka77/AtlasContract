@@ -2,48 +2,73 @@
 pragma solidity ^0.8.24;
 
 import "./LaunchpadSale.sol";
+import "./LaunchpadVesting.sol";
+import "../token/AtlasToken.sol";
+import "../utils/LiquidityLocker.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title LaunchpadFactory
- * @notice Deploys new LaunchpadSale contracts for any token
+ * @notice Deploys and manages multiple LaunchpadSales
  */
 contract LaunchpadFactory is Ownable {
-    address[] public sales;
-    address public vault;
-    address public liquidityLocker;
+    AtlasToken public atlasToken;
+    LiquidityLocker public liquidityLocker;
+    LaunchpadVesting public vestingModule;
+    address public treasury;
 
-    event SaleCreated(address indexed creator, address saleContract);
+    address[] public allSales;
 
-    constructor(address _vault, address _liquidityLocker) {
-        require(_vault != address(0) && _liquidityLocker != address(0), "zero address");
-        vault = _vault;
+    event LaunchpadSaleCreated(address indexed sale);
+
+    constructor(
+        AtlasToken _atlasToken,
+        LiquidityLocker _liquidityLocker,
+        LaunchpadVesting _vestingModule,
+        address _treasury,
+        address _admin
+    ) {
+        require(address(_atlasToken) != address(0) && _treasury != address(0), "zero address");
+        atlasToken = _atlasToken;
         liquidityLocker = _liquidityLocker;
+        vestingModule = _vestingModule;
+        treasury = _treasury;
+        _transferOwnership(_admin);
     }
 
-    function createSale(
-        address token,
-        address treasury,
-        uint256 pricePerToken,
-        uint256 liquidityPercent,
-        bool buyerVesting
-    ) external onlyOwner returns (address) {
-        LaunchpadSale sale = new LaunchpadSale(
-            AtlasToken(token),
+    /**
+     * @notice Deploy a new LaunchpadSale
+     * @return sale Address of deployed sale
+     */
+    function createLaunchpadSale() external onlyOwner returns (address sale) {
+        LaunchpadSale newSale = new LaunchpadSale(
+            atlasToken,
             treasury,
-            vault,
+            vestingModule,
             liquidityLocker,
-            pricePerToken,
-            liquidityPercent,
-            buyerVesting
+            owner()
         );
-        sale.transferOwnership(msg.sender);
-        sales.push(address(sale));
-        emit SaleCreated(msg.sender, address(sale));
-        return address(sale);
+        allSales.push(address(newSale));
+        emit LaunchpadSaleCreated(address(newSale));
+        return address(newSale);
     }
 
-    function allSalesLength() external view returns (uint256) {
-        return sales.length;
+    function getAllSales() external view returns (address[] memory) {
+        return allSales;
+    }
+
+    function setTreasury(address _treasury) external onlyOwner {
+        require(_treasury != address(0), "zero address");
+        treasury = _treasury;
+    }
+
+    function setVestingModule(LaunchpadVesting _vestingModule) external onlyOwner {
+        require(address(_vestingModule) != address(0), "zero address");
+        vestingModule = _vestingModule;
+    }
+
+    function setLiquidityLocker(LiquidityLocker _locker) external onlyOwner {
+        require(address(_locker) != address(0), "zero address");
+        liquidityLocker = _locker;
     }
 }
