@@ -2,93 +2,72 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "../utils/SafeERC20.sol";
-import "../token/AtlasToken.sol";
 
 /**
  * @title LaunchpadVesting
- * @notice Optional buyer vesting module for Launchpad presales
+ * @notice Optional module for buyer vesting in LaunchpadSale
  */
-contract LaunchpadVesting is Ownable, ReentrancyGuard {
-    using SafeERC20 for AtlasToken;
-
-    struct VestingInfo {
-        uint256 totalAllocated;   // Total tokens allocated to user
-        uint256 totalClaimed;     // Tokens already claimed
-        uint256 startTime;        // Vesting start timestamp
-        uint256 endTime;          // Vesting end timestamp
+contract LaunchpadVesting is Ownable {
+    struct VestingSchedule {
+        uint256 totalAllocated;
+        uint256 totalClaimed;
+        uint256 startTime;
+        uint256 endTime;
     }
 
-    AtlasToken public atlasToken;
+    mapping(address => VestingSchedule) public schedules;
 
-    mapping(address => VestingInfo) public vestings;
+    event VestingUpdated(address indexed user, uint256 totalAllocated, uint256 startTime, uint256 endTime);
 
-    event BuyerVestingSet(address indexed buyer, uint256 amount, uint256 startTime, uint256 endTime);
-    event BuyerVestingClaimed(address indexed buyer, uint256 amount);
-
-    constructor(AtlasToken _atlasToken, address _admin) Ownable() {
-        atlasToken = _atlasToken;
-        _transferOwnership(_admin);
+    /**
+     * @notice Set or update vesting schedule for a user
+     * @dev Called by LaunchpadSale contract
+     */
+    function setVesting(
+        address user,
+        uint256 totalAllocated,
+        uint256 startTime,
+        uint256 endTime
+    ) external onlyOwner {
+        require(endTime > startTime, "Invalid vesting period");
+        schedules[user] = VestingSchedule(totalAllocated, 0, startTime, endTime);
+        emit VestingUpdated(user, totalAllocated, startTime, endTime);
     }
 
     /**
-     * @notice Set vesting schedule for a buyer (optional)
-     * @param buyer Address of the buyer
-     * @param amount Total token allocation
-     * @param duration Duration of vesting in seconds
+     * @notice Calculate vested amount for a user at current timestamp
      */
-    function setVesting(address buyer, uint256 amount, uint256 duration) external onlyOwner {
-        require(amount > 0, "Amount must be > 0");
-        require(duration > 0, "Duration must be > 0");
+    function vestedAmount(
+        address user,
+        uint256 totalAllocatedFromSale,
+        uint256 saleStartTime,
+        uint256 saleEndTime
+    ) external view returns (uint256) {
+        VestingSchedule memory schedule = schedules[user];
 
-        VestingInfo storage info = vestings[buyer];
-        info.totalAllocated += amount;
-        info.startTime = block.timestamp;
-        info.endTime = block.timestamp + duration;
+        uint256 totalAllocated = schedule.totalAllocated > 0 ? schedule.totalAllocated : totalAllocatedFromSale;
+        uint256 startTime = schedule.startTime > 0 ? schedule.startTime : saleStartTime;
+        uint256 endTime = schedule.endTime > 0 ? schedule.endTime : saleEndTime;
 
-        emit BuyerVestingSet(buyer, amount, info.startTime, info.endTime);
-    }
-
-    /**
-     * @notice Claim vested tokens
-     */
-    function claim() external nonReentrant {
-        VestingInfo storage info = vestings[msg.sender];
-        require(info.totalAllocated > 0, "No allocation");
-
-        uint256 claimable = _vestedAmount(info);
-        require(claimable > 0, "Nothing to claim");
-
-        info.totalClaimed += claimable;
-        atlasToken.safeTransfer(msg.sender, claimable);
-
-        emit BuyerVestingClaimed(msg.sender, claimable);
-    }
-
-    /**
-     * @notice Compute vested amount for a user (linear vesting)
-     */
-    function _vestedAmount(VestingInfo memory info) internal view returns (uint256) {
-        if (block.timestamp >= info.endTime) {
-            return info.totalAllocated - info.totalClaimed;
+        if (block.timestamp >= endTime) {
+            return totalAllocated;
+        } else if (block.timestamp <= startTime) {
+            return 0;
+        } else {
+            uint256 duration = endTime - startTime;
+            uint256 elapsed = block.timestamp - startTime;
+            return (totalAllocated * elapsed) / duration;
         }
-        uint256 duration = info.endTime - info.startTime;
-        uint256 elapsed = block.timestamp - info.startTime;
-        return ((info.totalAllocated * elapsed) / duration) - info.totalClaimed;
     }
 
     /**
-     * @notice View claimable amount for a buyer
+     * @notice Get claimable amount for a user, considering already claimed tokens
      */
-    function claimable(address buyer) external view returns (uint256) {
-        return _vestedAmount(vestings[buyer]);
-    }
-
-    /**
-     * @notice Emergency function to recover tokens (if needed)
-     */
-    function recoverTokens(address to, uint256 amount) external onlyOwner {
-        atlasToken.safeTransfer(to, amount);
+    function claimableAmount(address user, uint256 totalAllocatedFromSale, uint256 saleStartTime, uint256 saleEndTime, uint256 alreadyClaimed) external view returns (uint256) {
+        uint256 vested = vestedAmount(user, totalAllocatedFromSale, saleStartTime, saleEndTime);
+        if (vested <= alreadyClaimed) {
+            return 0;
+        }
+        return vested - alreadyClaimed;
     }
 }
