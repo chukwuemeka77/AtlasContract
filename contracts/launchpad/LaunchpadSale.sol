@@ -3,127 +3,160 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "../token/AtlasToken.sol";
 import "../utils/SafeERC20.sol";
-import "./LaunchpadVesting.sol";
-import "../utils/LiquidityLocker.sol";
+import "../token/AtlasToken.sol";
 
-/**
- * @title LaunchpadSale
- * @notice Handles presale participation, token claiming, optional buyer vesting, and mandatory liquidity
- */
+interface ILiquidityLocker {
+    function lockLiquidity(address token, uint256 amount, uint256 unlockTime) external;
+}
+
 contract LaunchpadSale is Ownable, ReentrancyGuard {
     using SafeERC20 for AtlasToken;
 
+    // -------------------------
+    // Core Tokens & Treasury
+    // -------------------------
     AtlasToken public atlasToken;
-    address public treasury; // USDC or ETH collected
-    LaunchpadVesting public vestingModule;
-    LiquidityLocker public liquidityLocker;
+    address public treasury;               // VAULT_ADMIN_ADDRESS
+    ILiquidityLocker public liquidityLocker;
 
+    // -------------------------
+    // Launch Fee
+    // -------------------------
+    uint256 public launchFee;              // Fee required to start launch
+    mapping(address => bool) public feePaid;
+
+    // -------------------------
+    // Sale Info
+    // -------------------------
     struct SaleInfo {
         uint256 totalAllocated;
         uint256 totalClaimed;
         uint256 startTime;
         uint256 endTime;
-        bool vestingEnabled; // optional vesting for buyers
+        bool liquidityLocked;
+        bool teamVestingSet;
     }
 
     mapping(address => SaleInfo) public sales;
 
-    event SaleParticipated(address indexed user, uint256 amount, bool vesting);
-    event SaleClaimed(address indexed user, uint256 amount);
-    event LiquidityAdded(address indexed locker, uint256 amount);
+    // -------------------------
+    // Events
+    // -------------------------
+    event LaunchFeePaid(address indexed projectOwner, uint256 amount);
+    event PresaleParticipated(address indexed user, uint256 amount);
+    event PresaleClaimed(address indexed user, uint256 amount);
+    event LiquidityLocked(address indexed projectOwner, uint256 amount, uint256 unlockTime);
+    event TeamVestingSet(address indexed projectOwner, uint256 totalAmount, uint256 duration);
 
+    // -------------------------
+    // Constructor
+    // -------------------------
     constructor(
         AtlasToken _atlasToken,
         address _treasury,
-        LaunchpadVesting _vestingModule,
-        LiquidityLocker _liquidityLocker,
+        ILiquidityLocker _liquidityLocker,
+        uint256 _launchFee,
         address _admin
     ) {
-        require(address(_atlasToken) != address(0) && _treasury != address(0), "zero address");
         atlasToken = _atlasToken;
         treasury = _treasury;
-        vestingModule = _vestingModule;
         liquidityLocker = _liquidityLocker;
-        _transferOwnership(_admin); // admin from .env
+        launchFee = _launchFee;
+        _transferOwnership(_admin);
     }
 
-    /**
-     * @notice Participate in presale
-     * @param user Buyer address
-     * @param amount Token allocation
-     * @param enableVesting True to enable vesting for this buyer
-     */
-    function participate(
-        address user,
-        uint256 amount,
-        bool enableVesting
-    ) external onlyOwner {
+    // -------------------------
+    // Launch Fee
+    // -------------------------
+    function payLaunchFee() external payable {
+        require(msg.value >= launchFee, "Insufficient launch fee");
+        payable(treasury).transfer(msg.value);
+        feePaid[msg.sender] = true;
+        emit LaunchFeePaid(msg.sender, msg.value);
+    }
+
+    function setLaunchFee(uint256 _launchFee) external onlyOwner {
+        launchFee = _launchFee;
+    }
+
+    // -------------------------
+    // Presale Participation (Buyer)
+    // Optional vesting
+    // -------------------------
+    function participate(address user, uint256 amount, uint256 vestingMonths) external onlyOwner {
+        require(feePaid[msg.sender], "Launch fee not paid");
         SaleInfo storage info = sales[user];
-        require(block.timestamp < info.endTime || info.endTime == 0, "Sale ended");
 
         info.totalAllocated += amount;
         info.startTime = block.timestamp;
-        info.endTime = block.timestamp + 30 days;
-        info.vestingEnabled = enableVesting;
-
-        if (enableVesting) {
-            vestingModule.setVesting(user, amount, block.timestamp, block.timestamp + 30 days);
-        }
-
-        emit SaleParticipated(user, amount, enableVesting);
+        info.endTime = vestingMonths > 0 ? block.timestamp + vestingMonths * 30 days : block.timestamp;
+        emit PresaleParticipated(user, amount);
     }
 
-    /**
-     * @notice Claim tokens after sale
-     */
+    // -------------------------
+    // Claim Tokens
+    // -------------------------
     function claim() external nonReentrant {
         SaleInfo storage info = sales[msg.sender];
         require(info.totalAllocated > 0, "No allocation");
 
-        uint256 claimable;
-        if (info.vestingEnabled) {
-            vestingModule.claim();
-            claimable = vestingModule._vestedAmount(
-                vestingModule.vestings(msg.sender)
-            );
-        } else {
-            claimable = info.totalAllocated - info.totalClaimed;
-            require(claimable > 0, "Nothing to claim");
-            info.totalClaimed += claimable;
-            atlasToken.safeTransfer(msg.sender, claimable);
+        uint256 claimable = _vestedAmount(info);
+        require(claimable > 0, "Nothing to claim");
+
+        info.totalClaimed += claimable;
+        atlasToken.safeTransfer(msg.sender, claimable);
+        emit PresaleClaimed(msg.sender, claimable);
+    }
+
+    // -------------------------
+    // Team/Founder Vesting (Mandatory)
+    // -------------------------
+    function setTeamVesting(address team, uint256 totalAmount, uint256 months) external onlyOwner {
+        SaleInfo storage info = sales[team];
+        require(!info.teamVestingSet, "Team vesting already set");
+        require(totalAmount > 0 && months > 0, "Invalid vesting params");
+
+        info.totalAllocated = totalAmount;
+        info.startTime = block.timestamp;
+        info.endTime = block.timestamp + months * 30 days;
+        info.teamVestingSet = true;
+
+        emit TeamVestingSet(team, totalAmount, months);
+    }
+
+    // -------------------------
+    // Liquidity Addition & Lock (Mandatory)
+    // -------------------------
+    function lockLiquidity(address token, uint256 amount, uint256 unlockTime) external onlyOwner {
+        require(feePaid[msg.sender], "Launch fee not paid");
+        require(amount > 0 && unlockTime > block.timestamp, "Invalid liquidity params");
+
+        IERC20(token).transfer(address(liquidityLocker), amount);
+        liquidityLocker.lockLiquidity(token, amount, unlockTime);
+
+        emit LiquidityLocked(msg.sender, amount, unlockTime);
+    }
+
+    // -------------------------
+    // Internal vesting calculation
+    // -------------------------
+    function _vestedAmount(SaleInfo memory info) internal view returns (uint256) {
+        if (block.timestamp >= info.endTime) {
+            return info.totalAllocated - info.totalClaimed;
         }
-
-        emit SaleClaimed(msg.sender, claimable);
+        if (info.endTime > info.startTime) {
+            uint256 duration = info.endTime - info.startTime;
+            uint256 elapsed = block.timestamp - info.startTime;
+            return ((info.totalAllocated * elapsed) / duration) - info.totalClaimed;
+        }
+        return info.totalAllocated - info.totalClaimed;
     }
 
-    /**
-     * @notice Add and lock liquidity (mandatory)
-     * @param amount Amount of tokens to add to liquidity
-     * @param unlockTime Timestamp for liquidity unlock
-     */
-    function addLiquidity(uint256 amount, uint256 unlockTime) external onlyOwner {
-        require(amount > 0, "Zero liquidity");
-        atlasToken.safeTransfer(address(liquidityLocker), amount);
-        liquidityLocker.lockTokens(address(atlasToken), amount, unlockTime);
-
-        emit LiquidityAdded(address(liquidityLocker), amount);
-    }
-
-    /**
-     * @notice Update treasury address
-     */
+    // -------------------------
+    // Admin
+    // -------------------------
     function setTreasury(address _treasury) external onlyOwner {
-        require(_treasury != address(0), "zero address");
         treasury = _treasury;
-    }
-
-    /**
-     * @notice Update vesting module
-     */
-    function setVestingModule(LaunchpadVesting _vestingModule) external onlyOwner {
-        require(address(_vestingModule) != address(0), "zero address");
-        vestingModule = _vestingModule;
     }
 }
