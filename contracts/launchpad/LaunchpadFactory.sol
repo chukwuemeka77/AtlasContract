@@ -2,19 +2,17 @@
 pragma solidity ^0.8.24;
 
 import "./LaunchpadSale.sol";
-import "../presale/Vesting.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title LaunchpadFactory
- * @notice Factory to deploy LaunchpadSale contracts.
- * - Every sale includes mandatory vesting
- * - Liquidity add is mandatory during finalize
+ * @notice Deploy LaunchpadSale contracts for external projects.
+ * - Vesting and auto liquidity are optional.
  */
 contract LaunchpadFactory is Ownable {
-    address public router;        // AtlasRouter address
-    address public vault;         // Platform treasury / fee sink
-    address[] public allSales;    // All deployed sales
+    address public router;  // AtlasRouter address (for optional liquidity add)
+    address public vault;   // Platform treasury / fee sink
+    address[] public allSales;
 
     event SaleCreated(
         address indexed creator,
@@ -24,8 +22,8 @@ contract LaunchpadFactory is Ownable {
     );
 
     constructor(address _router, address _vault) {
-        require(_router != address(0), "LaunchpadFactory: zero router");
-        require(_vault != address(0), "LaunchpadFactory: zero vault");
+        require(_router != address(0), "zero router");
+        require(_vault != address(0), "zero vault");
         router = _router;
         vault = _vault;
     }
@@ -36,12 +34,13 @@ contract LaunchpadFactory is Ownable {
 
     /**
      * @notice Create a sale for a token
-     * @param token Token being sold
-     * @param paymentToken Token used for payment (USDC/WETH)
-     * @param price Price per token (scaled by payment token decimals)
-     * @param hardcap Max tokens to sell
-     * @param tgePercent % released at TGE
-     * @param vestingDuration Vesting duration (seconds)
+     * @param token Token being sold (project token)
+     * @param paymentToken Token used for payment (e.g., USDC)
+     * @param price Payment token per project token (scaled by paymentToken decimals)
+     * @param hardcap Total tokens allocated for sale
+     * @param tgePercent Percent released at TGE (0-100)
+     * @param vesting Duration of vesting in seconds (0 = no vesting)
+     * @param autoAddLiquidity Whether to add liquidity on finalize
      */
     function createSale(
         address token,
@@ -49,17 +48,12 @@ contract LaunchpadFactory is Ownable {
         uint256 price,
         uint256 hardcap,
         uint8 tgePercent,
-        uint256 vestingDuration
-    ) external returns (address sale, address vesting) {
-        require(token != address(0), "LaunchpadFactory: zero token");
-        require(paymentToken != address(0), "LaunchpadFactory: zero paymentToken");
-        require(vestingDuration > 0, "LaunchpadFactory: vesting required");
+        uint256 vesting,
+        bool autoAddLiquidity
+    ) external returns (address sale, address vestingAddress) {
+        require(token != address(0) && paymentToken != address(0), "zero token");
 
-        // Deploy vesting contract (mandatory)
-        Vesting v = new Vesting(token, msg.sender, vestingDuration);
-        vesting = address(v);
-
-        // Deploy sale contract
+        // Deploy LaunchpadSale contract
         LaunchpadSale s = new LaunchpadSale(
             msg.sender,
             token,
@@ -68,24 +62,23 @@ contract LaunchpadFactory is Ownable {
             hardcap,
             tgePercent,
             vesting,
+            autoAddLiquidity,
             router,
             vault
         );
 
         sale = address(s);
-        allSales.push(sale);
+        vestingAddress = vesting > 0 ? address(s) : address(0); // Vesting handled internally
 
-        emit SaleCreated(msg.sender, sale, vesting, block.timestamp);
+        allSales.push(sale);
+        emit SaleCreated(msg.sender, sale, vestingAddress, block.timestamp);
     }
 
     function setRouter(address _router) external onlyOwner {
-        require(_router != address(0), "LaunchpadFactory: zero router");
         router = _router;
     }
 
     function setVault(address _vault) external onlyOwner {
-        require(_vault != address(0), "LaunchpadFactory: zero vault");
         vault = _vault;
     }
 }
-
