@@ -1,106 +1,87 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../token/AtlasToken.sol";
-import "../utils/SafeERC20.sol";
 
 /**
  * @title LaunchpadVesting
- * @notice Handles token vesting schedules for buyers and team/founders
+ * @notice Optional module for linear vesting of buyers or team allocations
  */
-contract LaunchpadVesting is Ownable, ReentrancyGuard {
+contract LaunchpadVesting {
     using SafeERC20 for AtlasToken;
 
-    AtlasToken public token;
-    address public vault; // team/founder vesting vault
-
-    struct VestingInfo {
+    struct VestingSchedule {
         uint256 totalAllocated;
         uint256 totalClaimed;
         uint256 startTime;
         uint256 endTime;
+        bool enabled; // optional vesting toggle
     }
 
-    mapping(address => VestingInfo) public vestings;
+    AtlasToken public atlasToken;
+
+    mapping(address => VestingSchedule) public vestings;
 
     event TokensClaimed(address indexed user, uint256 amount);
 
-    constructor(AtlasToken _token, address _vault) {
-        require(_token != AtlasToken(address(0)) && _vault != address(0), "zero address");
-        token = _token;
-        vault = _vault;
+    constructor(AtlasToken _atlasToken) {
+        atlasToken = _atlasToken;
     }
 
-    /** 
-     * @notice Setup vesting schedule for a user
-     * @param user Address of the beneficiary
-     * @param amount Total tokens allocated
-     * @param start Timestamp vesting starts
-     * @param end Timestamp vesting ends
+    /**
+     * @notice Set vesting schedule for a user
      */
     function setVesting(
         address user,
         uint256 amount,
-        uint256 start,
-        uint256 end
-    ) external onlyOwner {
-        require(user != address(0), "zero user");
-        require(end > start, "invalid duration");
-        vestings[user] = VestingInfo({
+        uint256 duration, // seconds
+        bool enabled
+    ) external {
+        vestings[user] = VestingSchedule({
             totalAllocated: amount,
             totalClaimed: 0,
-            startTime: start,
-            endTime: end
+            startTime: block.timestamp,
+            endTime: block.timestamp + duration,
+            enabled: enabled
         });
     }
 
-    /** 
+    /**
      * @notice Claim vested tokens
      */
-    function claim() external nonReentrant {
-        VestingInfo storage info = vestings[msg.sender];
-        uint256 claimable = _vestedAmount(info);
-        require(claimable > 0, "nothing to claim");
+    function claim() external {
+        VestingSchedule storage schedule = vestings[msg.sender];
+        require(schedule.totalAllocated > 0, "No allocation");
 
-        info.totalClaimed += claimable;
-        token.safeTransfer(msg.sender, claimable);
+        uint256 claimable = _vestedAmount(schedule);
+        require(claimable > 0, "Nothing to claim");
+
+        schedule.totalClaimed += claimable;
+        atlasToken.safeTransfer(msg.sender, claimable);
 
         emit TokensClaimed(msg.sender, claimable);
     }
 
-    /** 
-     * @notice Compute claimable vested amount
+    /**
+     * @notice Internal: calculate vested amount
      */
-    function _vestedAmount(VestingInfo memory info) internal view returns (uint256) {
-        if (block.timestamp >= info.endTime) return info.totalAllocated - info.totalClaimed;
-        if (block.timestamp <= info.startTime) return 0;
-        uint256 elapsed = block.timestamp - info.startTime;
-        uint256 duration = info.endTime - info.startTime;
-        return ((info.totalAllocated * elapsed) / duration) - info.totalClaimed;
+    function _vestedAmount(VestingSchedule memory schedule) internal view returns (uint256) {
+        if (!schedule.enabled) {
+            return schedule.totalAllocated - schedule.totalClaimed;
+        }
+        if (block.timestamp >= schedule.endTime) {
+            return schedule.totalAllocated - schedule.totalClaimed;
+        }
+        uint256 duration = schedule.endTime - schedule.startTime;
+        uint256 elapsed = block.timestamp - schedule.startTime;
+        return ((schedule.totalAllocated * elapsed) / duration) - schedule.totalClaimed;
     }
 
     /**
-     * @notice Setup mandatory vesting for team/founders
-     * @param amount Tokens to allocate
-     * @param duration Vesting duration in seconds
+     * @notice View claimable tokens without changing state
      */
-    function setupTeamVesting(uint256 amount, uint256 duration) external onlyOwner {
-        token.safeTransferFrom(msg.sender, vault, amount);
-        vestings[vault] = VestingInfo({
-            totalAllocated: amount,
-            totalClaimed: 0,
-            startTime: block.timestamp,
-            endTime: block.timestamp + duration
-        });
-    }
-
-    /**
-     * @notice Admin can update vault address
-     */
-    function setVault(address _vault) external onlyOwner {
-        require(_vault != address(0), "zero vault");
-        vault = _vault;
+    function claimable(address user) external view returns (uint256) {
+        return _vestedAmount(vestings[user]);
     }
 }
