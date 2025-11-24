@@ -2,36 +2,50 @@
 pragma solidity ^0.8.24;
 
 import "./LaunchPool.sol";
+import "../token/AtlasToken.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title LaunchPoolFactory
- * @notice Deploys new LaunchPool instances for any token pair
+ * @notice Deploys LaunchPools for staking/reward programs
  */
 contract LaunchPoolFactory is Ownable {
-    address[] public pools;
-    address public vault;
+    AtlasToken public atlasToken;
+    address[] public allPools;
 
-    event PoolCreated(address indexed creator, address pool);
+    event LaunchPoolCreated(address indexed pool);
 
-    constructor(address _vault) {
-        require(_vault != address(0), "zero vault");
-        vault = _vault;
+    constructor(AtlasToken _atlasToken, address _admin) {
+        require(address(_atlasToken) != address(0), "zero address");
+        atlasToken = _atlasToken;
+        _transferOwnership(_admin);
     }
 
-    function createPool(
-        address stakeToken,
-        address rewardToken,
-        uint256 rewardRatePerSecond // optional, can be 0
-    ) external onlyOwner returns (address) {
-        LaunchPool pool = new LaunchPool(stakeToken, rewardToken, vault, rewardRatePerSecond);
-        pool.transferOwnership(msg.sender);
-        pools.push(address(pool));
-        emit PoolCreated(msg.sender, address(pool));
-        return address(pool);
+    /**
+     * @notice Create a new LaunchPool
+     * @param rewardRate Reward rate per second (optional, can be zero)
+     * @param startTime Pool start time
+     * @param endTime Pool end time
+     * @return pool Address of deployed LaunchPool
+     */
+    function createLaunchPool(
+        uint256 rewardRate,
+        uint256 startTime,
+        uint256 endTime
+    ) external onlyOwner returns (address pool) {
+        LaunchPool newPool = new LaunchPool(
+            atlasToken,
+            rewardRate,
+            startTime,
+            endTime,
+            owner()
+        );
+        allPools.push(address(newPool));
+        emit LaunchPoolCreated(address(newPool));
+        return address(newPool);
     }
 
-    function allPoolsLength() external view returns (uint256) {
-        return pools.length;
+    function getAllPools() external view returns (address[] memory) {
+        return allPools;
     }
 }
