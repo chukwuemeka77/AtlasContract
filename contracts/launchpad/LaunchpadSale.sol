@@ -3,9 +3,8 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "../utils/SafeERC20.sol";
 import "../token/AtlasToken.sol";
-import "./LaunchpadVesting.sol";
 import "../utils/LiquidityLocker.sol";
 
 contract LaunchpadSale is Ownable, ReentrancyGuard {
@@ -16,120 +15,106 @@ contract LaunchpadSale is Ownable, ReentrancyGuard {
         uint256 totalClaimed;
         uint256 startTime;
         uint256 endTime;
+        bool buyerVesting; // optional vesting for buyers
+        bool isMeme;       // meme coin flag
     }
 
     AtlasToken public atlasToken;
-    address public treasury; // where ETH and USDC go
+    address public treasury; // ETH or USDC collected
     LiquidityLocker public liquidityLocker;
-    LaunchpadVesting public vestingModule;
 
-    uint256 public launchFee; // in Atlas (ETH equivalent)
+    uint256 public launchpadFee; // in Atlas, read from .env
+    uint256 public minLiquidity; // minimum liquidity requirement
+    uint256 public founderVestingMonths = 3; // mandatory
 
-    mapping(address => SaleInfo) public presales;
-    mapping(address => bool) public isTeamOrFounder;
+    mapping(address => SaleInfo) public sales;
 
-    event PresaleParticipated(address indexed user, uint256 amount);
-    event PresaleClaimed(address indexed user, uint256 amount);
-    event TeamVested(address indexed teamMember, uint256 amount);
+    event SaleParticipated(address indexed user, uint256 amount);
+    event SaleClaimed(address indexed user, uint256 amount);
 
     constructor(
         AtlasToken _atlasToken,
         address _treasury,
-        address _admin,
         LiquidityLocker _locker,
-        LaunchpadVesting _vesting,
-        uint256 _launchFee
-    ) {
+        uint256 _launchpadFee,
+        uint256 _minLiquidity,
+        address _admin
+    ) Ownable() {
         atlasToken = _atlasToken;
         treasury = _treasury;
         liquidityLocker = _locker;
-        vestingModule = _vesting;
-        launchFee = _launchFee;
+        launchpadFee = _launchpadFee;
+        minLiquidity = _minLiquidity;
         _transferOwnership(_admin);
     }
 
-    /**
-     * @notice Buyer participates in presale
-     * Optional vesting delegated to LaunchpadVesting
+    /** 
+     * @notice Participate in sale
+     * @param user buyer address
+     * @param amount amount purchased
+     * @param vesting optional vesting for buyers
+     * @param memeFlag true if token is meme coin
      */
-    function participate(address user, uint256 amount, bool useVesting) external onlyOwner {
-        require(amount > 0, "Amount 0");
+    function participate(
+        address user,
+        uint256 amount,
+        bool vesting,
+        bool memeFlag
+    ) external payable onlyOwner {
+        require(msg.value >= launchpadFee, "Launchpad fee not paid");
 
-        if (useVesting) {
-            vestingModule.setVesting(user, amount, 30 days, true);
-        } else {
-            SaleInfo storage info = presales[user];
-            info.totalAllocated += amount;
-            info.startTime = block.timestamp;
-            info.endTime = block.timestamp + 30 days; // default period
-        }
+        SaleInfo storage info = sales[user];
+        require(block.timestamp < info.endTime || info.endTime == 0, "Sale ended");
 
-        // Transfer launch fee in Atlas from user
-        atlasToken.safeTransferFrom(user, address(this), launchFee);
+        info.totalAllocated += amount;
+        info.startTime = block.timestamp;
+        info.endTime = block.timestamp + 30 days;
+        info.buyerVesting = vesting;
+        info.isMeme = memeFlag;
 
-        emit PresaleParticipated(user, amount);
+        emit SaleParticipated(user, amount);
     }
 
     /**
-     * @notice Claim buyer tokens (optional vesting)
+     * @notice Claim purchased tokens
      */
     function claim() external nonReentrant {
-        SaleInfo storage info = presales[msg.sender];
+        SaleInfo storage info = sales[msg.sender];
+        require(info.totalAllocated > 0, "No allocation");
 
-        uint256 claimableAmount = info.totalAllocated > 0 ? _vestedAmount(info) : vestingModule.claimable(msg.sender);
-        require(claimableAmount > 0, "Nothing to claim");
+        uint256 claimable = info.buyerVesting ? _vestedAmount(info) : info.totalAllocated - info.totalClaimed;
+        require(claimable > 0, "Nothing to claim");
 
-        if (info.totalAllocated > 0) {
-            info.totalClaimed += claimableAmount;
-        } else {
-            vestingModule.claim(); // delegate to vesting module
-        }
+        info.totalClaimed += claimable;
+        atlasToken.safeTransfer(msg.sender, claimable);
 
-        atlasToken.safeTransfer(msg.sender, claimableAmount);
-        emit PresaleClaimed(msg.sender, claimableAmount);
+        emit SaleClaimed(msg.sender, claimable);
     }
 
     /**
-     * @notice Compute vested amount for buyers without vesting module
+     * @notice Compute vested amount for buyers (optional)
      */
     function _vestedAmount(SaleInfo memory info) internal view returns (uint256) {
-        if (block.timestamp >= info.endTime) {
-            return info.totalAllocated - info.totalClaimed;
-        }
+        if (!info.buyerVesting) return info.totalAllocated - info.totalClaimed;
+        if (block.timestamp >= info.endTime) return info.totalAllocated - info.totalClaimed;
+
         uint256 duration = info.endTime - info.startTime;
         uint256 elapsed = block.timestamp - info.startTime;
         return ((info.totalAllocated * elapsed) / duration) - info.totalClaimed;
     }
 
-    /**
-     * @notice Mandatory team/founder vesting
+    /** 
+     * @notice Enforce liquidity + founder vesting for meme coins
      */
-    function setTeamVesting(address teamMember, uint256 amount, uint256 duration) external onlyOwner {
-        require(amount > 0, "Amount 0");
-        isTeamOrFounder[teamMember] = true;
-        vestingModule.setVesting(teamMember, amount, duration, true);
-        emit TeamVested(teamMember, amount);
+    function finalizeSale(uint256 liquidityAmount, address tokenAddress) external onlyOwner {
+        require(liquidityAmount >= minLiquidity, "Insufficient liquidity");
+
+        // Lock liquidity for meme coins and all tokens
+        atlasToken.approve(address(liquidityLocker), liquidityAmount);
+        liquidityLocker.lockLiquidity(tokenAddress, liquidityAmount, block.timestamp + 90 days);
     }
 
-    /**
-     * @notice Lock mandatory liquidity
-     */
-    function lockLiquidity(address token, uint256 amount, uint256 duration) external onlyOwner {
-        atlasToken.safeApprove(address(liquidityLocker), amount);
-        liquidityLocker.lock(token, amount, duration);
-    }
-
-    /**
-     * @notice Update treasury
-     */
     function setTreasury(address _treasury) external onlyOwner {
         treasury = _treasury;
-    }
-
-    /**
-     * @notice Update launch fee (ETH equivalent in Atlas)
-     */
-    function setLaunchFee(uint256 _fee) external onlyOwner {
-        launchFee = _fee;
     }
 }
