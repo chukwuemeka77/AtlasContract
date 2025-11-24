@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "./LaunchPool.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+/**
+ * @title LaunchPoolFactory
+ * @notice Deploy LaunchPool contracts for staking/rewards programs.
+ */
+contract LaunchPoolFactory is Ownable {
+    address public vault; // VAULT_ADMIN_ADDRESS
+    address[] public allPools;
+
+    event PoolCreated(
+        address indexed creator,
+        address pool,
+        address stakedToken,
+        address rewardToken,
+        uint256 rewardRate,
+        uint256 startTime,
+        uint256 endTime
+    );
+
+    constructor(address _vault) {
+        require(_vault != address(0), "zero vault");
+        vault = _vault;
+    }
+
+    function allPoolsLength() external view returns (uint256) {
+        return allPools.length;
+    }
+
+    /**
+     * @notice Deploy a new staking/reward pool
+     * @param stakedToken Token users will stake
+     * @param rewardToken Token users earn as reward
+     * @param rewardRate Tokens per second (optional: 0 = manual reward)
+     * @param startTime Pool start timestamp
+     * @param endTime Pool end timestamp
+     */
+    function createPool(
+        address stakedToken,
+        address rewardToken,
+        uint256 rewardRate,
+        uint256 startTime,
+        uint256 endTime
+    ) external returns (address pool) {
+        require(stakedToken != address(0), "zero stakedToken");
+        require(rewardToken != address(0), "zero rewardToken");
+        require(endTime > startTime, "invalid duration");
+
+        LaunchPool p = new LaunchPool(
+            msg.sender,
+            stakedToken,
+            rewardToken,
+            rewardRate,
+            startTime,
+            endTime,
+            vault
+        );
+
+        pool = address(p);
+        allPools.push(pool);
+
+        emit PoolCreated(msg.sender, pool, stakedToken, rewardToken, rewardRate, startTime, endTime);
+    }
+
+    function setVault(address _vault) external onlyOwner {
+        require(_vault != address(0), "zero vault");
+        vault = _vault;
+    }
+}
