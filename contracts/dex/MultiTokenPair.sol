@@ -1,107 +1,94 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./AtlasLPRewards.sol";
+import "./MultiTokenPair.sol";
 
-/**
- * @title MultiTokenPair
- * @notice ERC20 pair LP with Atlas rewards and mandatory liquidity lock
- */
-contract MultiTokenPair is Ownable {
-    IERC20 public immutable tokenA;
-    IERC20 public immutable tokenB;
-    IERC20 public lpToken;
+interface IAtlasToken is IERC20 {}
 
-    AtlasLPRewards public rewards;
+contract MultiTokenRouter is Ownable {
+    // ---------------------------------------
+    // State
+    // ---------------------------------------
+    IAtlasToken public immutable atlasToken;
+    MultiTokenPair public factory; // reference to factory for pair creation / lookup
 
-    uint256 public totalSupply;
-    uint256 public minLockDuration; // from .env
+    event Swapped(address indexed user, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut);
+    event LiquidityAdded(address indexed user, address tokenA, address tokenB, uint256 amountA, uint256 amountB, uint256 lpTokens);
+    event LiquidityRemoved(address indexed user, address tokenA, address tokenB, uint256 amountA, uint256 amountB, uint256 lpTokens);
 
-    struct LPInfo {
-        uint256 amount;
-        uint256 lockEnd;
+    // ---------------------------------------
+    // Constructor
+    // ---------------------------------------
+    constructor(IAtlasToken _atlasToken, MultiTokenPair _factory) {
+        require(address(_atlasToken) != address(0), "Invalid Atlas token");
+        require(address(_factory) != address(0), "Invalid factory");
+        atlasToken = _atlasToken;
+        factory = _factory;
     }
 
-    mapping(address => LPInfo) public lpBalances;
+    // ---------------------------------------
+    // Swap exact input tokens for another
+    // ---------------------------------------
+    function swapExactTokensForTokens(
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut
+    ) external {
+        require(amountIn > 0, "Zero input");
+        MultiTokenPair pair = factory.getPair(address(tokenIn), address(tokenOut));
+        require(address(pair) != address(0), "Pair not found");
 
-    event LiquidityAdded(address indexed user, uint256 amountA, uint256 amountB, uint256 lpMinted);
-    event LiquidityRemoved(address indexed user, uint256 amountA, uint256 amountB, uint256 lpBurned);
+        tokenIn.transferFrom(msg.sender, address(pair), amountIn);
+        uint256 amountOut = pair.swap(msg.sender, tokenIn, tokenOut, amountIn);
+        require(amountOut >= minAmountOut, "Slippage exceeded");
 
-    constructor(
-        address _tokenA,
-        address _tokenB,
-        address _lpToken,
-        address _atlasRewardToken,
-        uint256 _minLockDuration  // set from factory using .env value
-    ) {
-        require(_tokenA != address(0) && _tokenB != address(0), "Invalid token addresses");
-        require(_lpToken != address(0), "Invalid LP token");
-
-        tokenA = IERC20(_tokenA);
-        tokenB = IERC20(_tokenB);
-        lpToken = IERC20(_lpToken);
-
-        rewards = new AtlasLPRewards(_atlasRewardToken);
-        minLockDuration = _minLockDuration;
+        emit Swapped(msg.sender, address(tokenIn), address(tokenOut), amountIn, amountOut);
     }
 
-    /// @notice Add liquidity and optionally stake LP for rewards
-    function addLiquidity(uint256 amountA, uint256 amountB, bool stakeLP) external {
-        require(amountA > 0 && amountB > 0, "Invalid amounts");
+    // ---------------------------------------
+    // Add liquidity to a pair
+    // ---------------------------------------
+    function addLiquidity(
+        IERC20 tokenA,
+        IERC20 tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired
+    ) external returns (uint256 lpTokens) {
+        MultiTokenPair pair = factory.getPair(address(tokenA), address(tokenB));
+        require(address(pair) != address(0), "Pair not found");
 
-        tokenA.transferFrom(msg.sender, address(this), amountA);
-        tokenB.transferFrom(msg.sender, address(this), amountB);
+        tokenA.transferFrom(msg.sender, address(pair), amountADesired);
+        tokenB.transferFrom(msg.sender, address(pair), amountBDesired);
 
-        uint256 lpMinted = sqrt(amountA * amountB); // proportional LP mint
-        totalSupply += lpMinted;
+        lpTokens = pair.addLiquidity(msg.sender, amountADesired, amountBDesired);
 
-        LPInfo storage userLP = lpBalances[msg.sender];
-        userLP.amount += lpMinted;
-        userLP.lockEnd = block.timestamp + minLockDuration;
-
-        if (stakeLP) {
-            lpToken.transfer(msg.sender, lpMinted); // transfer LP token for staking
-            rewards.updateRewardDebt(0, msg.sender);
-        }
-
-        emit LiquidityAdded(msg.sender, amountA, amountB, lpMinted);
+        emit LiquidityAdded(msg.sender, address(tokenA), address(tokenB), amountADesired, amountBDesired, lpTokens);
     }
 
-    /// @notice Remove liquidity after lock
-    function removeLiquidity(uint256 lpAmount) external {
-        LPInfo storage userLP = lpBalances[msg.sender];
-        require(lpAmount > 0 && lpAmount <= userLP.amount, "Invalid amount");
-        require(block.timestamp >= userLP.lockEnd, "Liquidity locked");
+    // ---------------------------------------
+    // Remove liquidity from a pair
+    // ---------------------------------------
+    function removeLiquidity(
+        IERC20 tokenA,
+        IERC20 tokenB,
+        uint256 lpAmount
+    ) external returns (uint256 amountA, uint256 amountB) {
+        MultiTokenPair pair = factory.getPair(address(tokenA), address(tokenB));
+        require(address(pair) != address(0), "Pair not found");
 
-        uint256 proportion = lpAmount * 1e18 / userLP.amount;
-        uint256 amountA = (tokenA.balanceOf(address(this)) * proportion) / 1e18;
-        uint256 amountB = (tokenB.balanceOf(address(this)) * proportion) / 1e18;
+        (amountA, amountB) = pair.removeLiquidity(msg.sender, lpAmount);
 
-        userLP.amount -= lpAmount;
-        totalSupply -= lpAmount;
-
-        // Instant claim Atlas rewards
-        rewards.updateRewardDebt(0, msg.sender);
-
-        tokenA.transfer(msg.sender, amountA);
-        tokenB.transfer(msg.sender, amountB);
-
-        emit LiquidityRemoved(msg.sender, amountA, amountB, lpAmount);
+        emit LiquidityRemoved(msg.sender, address(tokenA), address(tokenB), amountA, amountB, lpAmount);
     }
 
-    /// @notice Utility: sqrt for LP calculation
-    function sqrt(uint256 y) internal pure returns (uint256 z) {
-        if (y > 3) {
-            z = y;
-            uint256 x = y / 2 + 1;
-            while (x < z) {
-                z = x;
-                x = (y / x + x) / 2;
-            }
-        } else if (y != 0) {
-            z = 1;
-        }
+    // ---------------------------------------
+    // Admin: recover accidentally sent ERC20
+    // ---------------------------------------
+    function recoverToken(IERC20 token, uint256 amount) external onlyOwner {
+        token.transfer(owner(), amount);
     }
 }
