@@ -4,78 +4,61 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-/**
- * @title LiquidityLocker
- * @notice Locks liquidity tokens (LP) for a fixed period to prevent rug pulls
- */
 contract LiquidityLocker is Ownable {
     struct LockInfo {
-        address lpToken;
         uint256 amount;
         uint256 unlockTime;
-        address owner;
-        bool withdrawn;
+        bool claimed;
     }
 
-    LockInfo[] public locks;
+    // token => user => lock info
+    mapping(address => mapping(address => LockInfo)) public locks;
 
-    event LiquidityLocked(uint256 indexed lockId, address indexed lpToken, address indexed owner, uint256 amount, uint256 unlockTime);
-    event LiquidityWithdrawn(uint256 indexed lockId, address indexed lpToken, address indexed owner, uint256 amount);
+    uint256 public immutable minLockDuration; // seconds
 
-    /**
-     * @notice Lock LP tokens for a specified duration
-     * @param _lpToken Address of the LP token
-     * @param _amount Amount of LP tokens to lock
-     * @param _lockDuration Duration in seconds for the lock
-     */
-    function lockLiquidity(address _lpToken, uint256 _amount, uint256 _lockDuration) external returns (uint256 lockId) {
-        require(_amount > 0, "Amount must be > 0");
-        require(_lockDuration > 0, "Lock duration must be > 0");
+    event LiquidityLocked(address indexed token, address indexed user, uint256 amount, uint256 unlockTime);
+    event LiquidityUnlocked(address indexed token, address indexed user, uint256 amount);
 
-        IERC20(_lpToken).transferFrom(msg.sender, address(this), _amount);
-
-        lockId = locks.length;
-        locks.push(LockInfo({
-            lpToken: _lpToken,
-            amount: _amount,
-            unlockTime: block.timestamp + _lockDuration,
-            owner: msg.sender,
-            withdrawn: false
-        }));
-
-        emit LiquidityLocked(lockId, _lpToken, msg.sender, _amount, block.timestamp + _lockDuration);
+    constructor(uint256 _minLockDuration) {
+        require(_minLockDuration > 0, "Invalid duration");
+        minLockDuration = _minLockDuration;
     }
 
     /**
-     * @notice Withdraw LP tokens after lock expires
-     * @param _lockId ID of the liquidity lock
+     * @notice Lock liquidity tokens for the minimum duration
      */
-    function withdrawLiquidity(uint256 _lockId) external {
-        require(_lockId < locks.length, "Invalid lockId");
+    function lock(address token, address user, uint256 amount) external onlyOwner {
+        require(amount > 0, "Zero amount");
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
 
-        LockInfo storage lock = locks[_lockId];
-        require(msg.sender == lock.owner, "Not lock owner");
-        require(block.timestamp >= lock.unlockTime, "Lock not expired");
-        require(!lock.withdrawn, "Already withdrawn");
+        LockInfo storage info = locks[token][user];
+        info.amount += amount;
+        info.unlockTime = block.timestamp + minLockDuration;
+        info.claimed = false;
 
-        lock.withdrawn = true;
-        IERC20(lock.lpToken).transfer(lock.owner, lock.amount);
-
-        emit LiquidityWithdrawn(_lockId, lock.lpToken, lock.owner, lock.amount);
+        emit LiquidityLocked(token, user, amount, info.unlockTime);
     }
 
     /**
-     * @notice Get number of active locks
+     * @notice Unlock tokens after lock duration
      */
-    function totalLocks() external view returns (uint256) {
-        return locks.length;
+    function unlock(address token, address user) external {
+        LockInfo storage info = locks[token][user];
+        require(info.amount > 0, "No liquidity locked");
+        require(block.timestamp >= info.unlockTime, "Still locked");
+        require(!info.claimed, "Already claimed");
+
+        uint256 amount = info.amount;
+        info.claimed = true;
+        IERC20(token).transfer(user, amount);
+
+        emit LiquidityUnlocked(token, user, amount);
     }
 
     /**
-     * @notice View details of a lock
+     * @notice View locked info for a user
      */
-    function getLockInfo(uint256 _lockId) external view returns (LockInfo memory) {
-        require(_lockId < locks.length, "Invalid lockId");
-        return locks[_lockId];
+    function getLockInfo(address token, address user) external view returns (LockInfo memory) {
+        return locks[token][user];
     }
 }
