@@ -3,118 +3,96 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../token/AtlasToken.sol";
+import "./LaunchpadVesting.sol";
 import "../utils/LiquidityLocker.sol";
-
-interface IPriceOracle {
-    function getAtlasEthPrice() external view returns (uint256);
-}
 
 contract LaunchpadSale is Ownable, ReentrancyGuard {
     using SafeERC20 for AtlasToken;
 
-    // ----------------------------
-    // Tokens & Treasury
-    // ----------------------------
-    AtlasToken public atlasToken;
-    address public treasury;           // Collected fees & presale funds
-    LiquidityLocker public liquidityLocker;
-    IPriceOracle public priceOracle;
-
-    uint256 public launchFeeETH;       // ETH equivalent of launch fee (0.2 ETH)
-
-    // ----------------------------
-    // Vesting & Sale Info
-    // ----------------------------
     struct SaleInfo {
         uint256 totalAllocated;
         uint256 totalClaimed;
         uint256 startTime;
         uint256 endTime;
-        bool buyerVesting;            // Optional buyer vesting
     }
 
-    struct TeamVestingInfo {
-        uint256 totalAllocated;
-        uint256 totalClaimed;
-        uint256 startTime;
-        uint256 endTime;
-    }
+    AtlasToken public atlasToken;
+    address public treasury; // where ETH and USDC go
+    LiquidityLocker public liquidityLocker;
+    LaunchpadVesting public vestingModule;
 
-    mapping(address => SaleInfo) public buyers;
-    TeamVestingInfo public teamVesting;
+    uint256 public launchFee; // in Atlas (ETH equivalent)
 
-    event LaunchpadCreated(address indexed creator, uint256 feePaidAtlas);
-    event BuyerParticipated(address indexed buyer, uint256 amount);
-    event BuyerClaimed(address indexed buyer, uint256 amount);
+    mapping(address => SaleInfo) public presales;
+    mapping(address => bool) public isTeamOrFounder;
+
+    event PresaleParticipated(address indexed user, uint256 amount);
+    event PresaleClaimed(address indexed user, uint256 amount);
+    event TeamVested(address indexed teamMember, uint256 amount);
 
     constructor(
         AtlasToken _atlasToken,
         address _treasury,
-        LiquidityLocker _liquidityLocker,
-        uint256 _launchFeeETH,
-        IPriceOracle _priceOracle,
-        uint256 _teamAllocation,        // Enforced team vesting allocation
-        uint256 _teamVestingDuration    // In seconds
+        address _admin,
+        LiquidityLocker _locker,
+        LaunchpadVesting _vesting,
+        uint256 _launchFee
     ) {
         atlasToken = _atlasToken;
         treasury = _treasury;
-        liquidityLocker = _liquidityLocker;
-        launchFeeETH = _launchFeeETH;
-        priceOracle = _priceOracle;
-
-        // Initialize team vesting
-        teamVesting.totalAllocated = _teamAllocation;
-        teamVesting.startTime = block.timestamp;
-        teamVesting.endTime = block.timestamp + _teamVestingDuration;
+        liquidityLocker = _locker;
+        vestingModule = _vesting;
+        launchFee = _launchFee;
+        _transferOwnership(_admin);
     }
 
-    // ----------------------------
-    // Launchpad creation fee
-    // ----------------------------
-    function payLaunchFee() internal {
-        uint256 atlasPrice = priceOracle.getAtlasEthPrice(); // wei per ATLAS
-        uint256 feeInAtlas = (launchFeeETH * 1e18) / atlasPrice;
+    /**
+     * @notice Buyer participates in presale
+     * Optional vesting delegated to LaunchpadVesting
+     */
+    function participate(address user, uint256 amount, bool useVesting) external onlyOwner {
+        require(amount > 0, "Amount 0");
 
-        require(atlasToken.balanceOf(msg.sender) >= feeInAtlas, "Insufficient ATLAS for fee");
-        atlasToken.safeTransferFrom(msg.sender, treasury, feeInAtlas);
-
-        emit LaunchpadCreated(msg.sender, feeInAtlas);
-    }
-
-    // ----------------------------
-    // Buyer participation
-    // ----------------------------
-    function participate(uint256 amount, bool vesting) external {
-        payLaunchFee();
-
-        SaleInfo storage info = buyers[msg.sender];
-        info.totalAllocated += amount;
-        info.startTime = block.timestamp;
-        info.endTime = vesting ? block.timestamp + 30 days : block.timestamp;
-        info.buyerVesting = vesting;
-
-        // Collect payment in USDC or ETH to treasury if needed
-        emit BuyerParticipated(msg.sender, amount);
-    }
-
-    function claim() external {
-        SaleInfo storage info = buyers[msg.sender];
-        require(info.totalAllocated > 0, "No allocation");
-
-        uint256 claimable = _vestedAmount(info);
-        require(claimable > 0, "Nothing to claim");
-
-        info.totalClaimed += claimable;
-        atlasToken.safeTransfer(msg.sender, claimable);
-
-        emit BuyerClaimed(msg.sender, claimable);
-    }
-
-    function _vestedAmount(SaleInfo memory info) internal view returns (uint256) {
-        if (!info.buyerVesting) {
-            return info.totalAllocated - info.totalClaimed;
+        if (useVesting) {
+            vestingModule.setVesting(user, amount, 30 days, true);
+        } else {
+            SaleInfo storage info = presales[user];
+            info.totalAllocated += amount;
+            info.startTime = block.timestamp;
+            info.endTime = block.timestamp + 30 days; // default period
         }
+
+        // Transfer launch fee in Atlas from user
+        atlasToken.safeTransferFrom(user, address(this), launchFee);
+
+        emit PresaleParticipated(user, amount);
+    }
+
+    /**
+     * @notice Claim buyer tokens (optional vesting)
+     */
+    function claim() external nonReentrant {
+        SaleInfo storage info = presales[msg.sender];
+
+        uint256 claimableAmount = info.totalAllocated > 0 ? _vestedAmount(info) : vestingModule.claimable(msg.sender);
+        require(claimableAmount > 0, "Nothing to claim");
+
+        if (info.totalAllocated > 0) {
+            info.totalClaimed += claimableAmount;
+        } else {
+            vestingModule.claim(); // delegate to vesting module
+        }
+
+        atlasToken.safeTransfer(msg.sender, claimableAmount);
+        emit PresaleClaimed(msg.sender, claimableAmount);
+    }
+
+    /**
+     * @notice Compute vested amount for buyers without vesting module
+     */
+    function _vestedAmount(SaleInfo memory info) internal view returns (uint256) {
         if (block.timestamp >= info.endTime) {
             return info.totalAllocated - info.totalClaimed;
         }
@@ -123,42 +101,35 @@ contract LaunchpadSale is Ownable, ReentrancyGuard {
         return ((info.totalAllocated * elapsed) / duration) - info.totalClaimed;
     }
 
-    // ----------------------------
-    // Team vesting
-    // ----------------------------
-    function claimTeamVesting() external onlyOwner {
-        uint256 claimable = _teamVestedAmount();
-        require(claimable > 0, "Nothing to claim");
-
-        teamVesting.totalClaimed += claimable;
-        atlasToken.safeTransfer(msg.sender, claimable);
+    /**
+     * @notice Mandatory team/founder vesting
+     */
+    function setTeamVesting(address teamMember, uint256 amount, uint256 duration) external onlyOwner {
+        require(amount > 0, "Amount 0");
+        isTeamOrFounder[teamMember] = true;
+        vestingModule.setVesting(teamMember, amount, duration, true);
+        emit TeamVested(teamMember, amount);
     }
 
-    function _teamVestedAmount() internal view returns (uint256) {
-        if (block.timestamp >= teamVesting.endTime) {
-            return teamVesting.totalAllocated - teamVesting.totalClaimed;
-        }
-        uint256 duration = teamVesting.endTime - teamVesting.startTime;
-        uint256 elapsed = block.timestamp - teamVesting.startTime;
-        return ((teamVesting.totalAllocated * elapsed) / duration) - teamVesting.totalClaimed;
+    /**
+     * @notice Lock mandatory liquidity
+     */
+    function lockLiquidity(address token, uint256 amount, uint256 duration) external onlyOwner {
+        atlasToken.safeApprove(address(liquidityLocker), amount);
+        liquidityLocker.lock(token, amount, duration);
     }
 
-    // ----------------------------
-    // Mandatory liquidity lock
-    // ----------------------------
-    function lockLiquidity(address lpToken, uint256 amount, uint256 unlockTime) external onlyOwner {
-        atlasToken.safeTransferFrom(msg.sender, address(liquidityLocker), amount);
-        liquidityLocker.lock(lpToken, amount, unlockTime);
-    }
-
-    // ----------------------------
-    // Admin updates
-    // ----------------------------
+    /**
+     * @notice Update treasury
+     */
     function setTreasury(address _treasury) external onlyOwner {
         treasury = _treasury;
     }
 
-    function setLaunchFeeETH(uint256 _fee) external onlyOwner {
-        launchFeeETH = _fee;
+    /**
+     * @notice Update launch fee (ETH equivalent in Atlas)
+     */
+    function setLaunchFee(uint256 _fee) external onlyOwner {
+        launchFee = _fee;
     }
 }
