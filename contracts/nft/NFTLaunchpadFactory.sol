@@ -6,34 +6,30 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title NFTLaunchpadFactory
- * @notice Deploy and track multiple NFT collections
+ * @notice Factory to deploy NFT collections for launchpad sales
  */
 contract NFTLaunchpadFactory is Ownable {
-    NFTCollection[] public collections;
+    address[] public allCollections;
 
-    event CollectionCreated(address indexed creator, address collection);
+    event CollectionCreated(address indexed collection, string name, string symbol, uint256 maxSupply, uint256 mintPrice);
 
-    /**
-     * @notice Deploy a new NFT collection
-     */
     function createCollection(
-        string memory _name,
-        string memory _symbol,
-        string memory _baseURI,
-        uint256 _maxSupply,
-        uint256 _price
-    ) external onlyOwner returns (address) {
-        NFTCollection collection = new NFTCollection(_name, _symbol, _baseURI, _maxSupply, _price);
-        collections.push(collection);
+        string memory name,
+        string memory symbol,
+        string memory baseURI,
+        uint256 maxSupply,
+        uint256 mintPrice,
+        address treasury
+    ) external onlyOwner returns (address collection) {
+        NFTCollection nft = new NFTCollection(name, symbol, baseURI, maxSupply, mintPrice, treasury);
+        collection = address(nft);
+        allCollections.push(collection);
 
-        emit CollectionCreated(msg.sender, address(collection));
-        return address(collection);
+        emit CollectionCreated(collection, name, symbol, maxSupply, mintPrice);
     }
 
-    /**
-     * @notice Get total collections
-     */
-    function getCollections() external view returns (NFTCollection[] memory) {
-        return collections;
+    function allCollectionsLength() external view returns (uint256) {
+        return allCollections.length;
     }
 }
+
